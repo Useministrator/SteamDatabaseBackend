@@ -11,6 +11,7 @@ using System.Security.Cryptography;
 using System.Timers;
 using Dapper;
 using SteamKit2;
+using SteamKit2.Authentication;
 
 namespace SteamDatabaseBackend
 {
@@ -39,7 +40,7 @@ namespace SteamDatabaseBackend
             manager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
             manager.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
             manager.Subscribe<SteamUser.UpdateMachineAuthCallback>(OnMachineAuth);
-            manager.Subscribe<SteamUser.LoginKeyCallback>(OnLoginKey);
+            manager.Subscribe<SteamUser.SessionTokenCallback>(OnSessionToken);
         }
 
         public void Dispose()
@@ -78,17 +79,39 @@ namespace SteamDatabaseBackend
                 return;
             }
 
-            Steam.Instance.User.LogOn(new SteamUser.LogOnDetails
+            var accessToken = config.TryGetValue("backend.loginkey", out var loginToken) ? loginToken : null;
+            if (accessToken is null or "0")
             {
+                AuthSession authSession;
+                authSession = await Steam.Instance.Client.Authentication.BeginAuthSessionViaCredentialsAsync(new SteamKit2.Authentication.AuthSessionDetails
+                {
+                    Username = Settings.Current.Steam.Username,
+                    Password = Settings.Current.Steam.Password,
+                    IsPersistentSession = true,
+                    Authenticator = new UserConsoleAuthenticator(),
+                });
+                var result = await authSession.PollingWaitForResultAsync();     
+                accessToken = result.RefreshToken;
+                await LocalConfig.Update("backend.loginkey", accessToken);
+            }
+
+
+            
+            var logonDetails = new SteamUser.LogOnDetails
+            {
+                AccessToken = accessToken,
                 Username = Settings.Current.Steam.Username,
-                Password = Settings.Current.Steam.Password,
+                Password = loginToken == null ? Settings.Current.Steam.Password : null,
                 AuthCode = IsTwoFactor ? null : AuthCode,
                 TwoFactorCode = IsTwoFactor ? AuthCode : null,
                 ShouldRememberPassword = true,
-                SentryFileHash = config.TryGetValue("backend.sentryhash", out var sentryHash) ? Utils.StringToByteArray(sentryHash) : null,
-                LoginKey = config.TryGetValue("backend.loginkey", out var loginKey) ? loginKey : null,
+                SentryFileHash = config.TryGetValue("backend.sentryhash", out var sentryHash)
+                    ? Utils.StringToByteArray(sentryHash)
+                    : null,
                 LoginID = 0x78_50_61_77,
-            });
+            }; 
+
+            Steam.Instance.User.LogOn(logonDetails);
             AuthCode = null;
         }
 
@@ -138,12 +161,11 @@ namespace SteamDatabaseBackend
             if (callback.Result != EResult.OK)
             {
                 Log.WriteInfo(nameof(Steam), $"Failed to login: {callback.Result}");
-
                 return;
             }
 
             LastSuccessfulLogin = DateTime.Now;
-
+            
             Log.WriteInfo(nameof(Steam), $"Logged in, current Valve time is {callback.ServerTime:R}");
 
             await Steam.Instance.DepotProcessor.UpdateContentServerList();
@@ -211,13 +233,13 @@ namespace SteamDatabaseBackend
             await LocalConfig.Update("backend.sentryhash", Utils.ByteArrayToString(sentryHash));
         }
 
-        private async void OnLoginKey(SteamUser.LoginKeyCallback callback)
+        private static async void OnSessionToken(SteamUser.SessionTokenCallback callback)
         {
-            Log.WriteInfo(nameof(Steam), $"Got new login key with unique id {callback.UniqueID}");
+            Log.WriteInfo(nameof(Steam), $"Got new login key with unique id {callback.SessionToken}");
 
-            await LocalConfig.Update("backend.loginkey", callback.LoginKey);
+            await LocalConfig.Update("backend.loginkey", callback.SessionToken.ToString());
 
-            Steam.Instance.User.AcceptNewLoginKey(callback);
+            // Steam.Instance.User.AcceptNewLoginKey(callback);
         }
     }
 }

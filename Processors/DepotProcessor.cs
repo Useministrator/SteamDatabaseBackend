@@ -18,6 +18,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Dapper;
 using SteamKit2;
+using SteamKit2.CDN;
 
 namespace SteamDatabaseBackend
 {
@@ -28,12 +29,12 @@ namespace SteamDatabaseBackend
         public class ManifestJob
         {
             public uint ChangeNumber;
-            public uint DepotID;
-            public int BuildID;
-            public ulong ManifestID;
-            public ulong LastManifestID;
+            public uint DepotId;
+            public int BuildId;
+            public ulong ManifestId;
+            public ulong LastManifestId;
             public string DepotName;
-            public CDNClient.Server Server;
+            public Server Server;
             public byte[] DepotKey;
             public EResult Result = EResult.Fail;
             public bool StoredFilenamesEncrypted;
@@ -48,8 +49,8 @@ namespace SteamDatabaseBackend
         private SemaphoreSlim ManifestDownloadSemaphore = new SemaphoreSlim(15);
         private readonly string UpdateScript;
 
-        private CDNClient CDNClient;
-        private List<CDNClient.Server> CDNServers;
+        private Client CDNClient;
+        private List<Server> CDNServers;
 
         public int DepotLocksCount => DepotLocks.Count;
         public Dictionary<uint, byte>.KeyCollection DepotLocksKeys => DepotLocks.Keys;
@@ -61,13 +62,13 @@ namespace SteamDatabaseBackend
         public DepotProcessor(SteamClient client)
         {
             UpdateScript = Path.Combine(Application.Path, "files", "update.sh");
-            CDNClient = new CDNClient(client);
-            CDNServers = new List<CDNClient.Server>
+            CDNClient = new Client(client);
+            CDNServers = new List<Server>
             {
                 new DnsEndPoint(DefaultServer, 80)
             };
 
-            CDNClient.RequestTimeout = TimeSpan.FromSeconds(30);
+            Client.RequestTimeout = TimeSpan.FromSeconds(30);
 
             FileDownloader.SetCDNClient(CDNClient);
 
@@ -122,7 +123,7 @@ namespace SteamDatabaseBackend
                 }
             }
 
-            var newServers = new List<CDNClient.Server>();
+            var newServers = new List<Server>();
 
             foreach (var server in response["servers"].Children)
             {
@@ -161,7 +162,7 @@ namespace SteamDatabaseBackend
                 };
 
                 // Ignore keys that aren't integers, for example "branches"
-                if (!uint.TryParse(depot.Name, out request.DepotID))
+                if (!uint.TryParse(depot.Name, out request.DepotId))
                 {
                     continue;
                 }
@@ -176,7 +177,7 @@ namespace SteamDatabaseBackend
 
                 if (string.IsNullOrEmpty(request.DepotName))
                 {
-                    request.DepotName = $"SteamDB Unnamed Depot {request.DepotID}";
+                    request.DepotName = $"SteamDB Unnamed Depot {request.DepotId}";
                 }
                 else if (depot["dlcappid"].Value != null)
                 {
@@ -187,7 +188,7 @@ namespace SteamDatabaseBackend
                 }
 
                 // TODO: instead of locking we could wait for current process to finish
-                if (DepotLocks.ContainsKey(request.DepotID))
+                if (DepotLocks.ContainsKey(request.DepotId))
                 {
                     continue;
                 }
@@ -197,28 +198,28 @@ namespace SteamDatabaseBackend
                     && depot["manifests"]["beta"].Value != null
                     && depots["branches"]["beta"]["buildid"].AsInteger() > depots["branches"]["public"]["buildid"].AsInteger())
                 {
-                    request.BuildID = depots["branches"]["beta"]["buildid"].AsInteger();
-                    request.ManifestID = ulong.Parse(depot["manifests"]["beta"].Value);
+                    request.BuildId = depots["branches"]["beta"]["buildid"].AsInteger();
+                    request.ManifestId = ulong.Parse(depot["manifests"]["beta"].Value);
                 }
                 else
-                if (depot["manifests"]["public"].Value == null || !ulong.TryParse(depot["manifests"]["public"].Value, out request.ManifestID))
+                if (depot["manifests"]["public"].Value == null || !ulong.TryParse(depot["manifests"]["public"].Value, out request.ManifestId))
                 {
                     var branch = depot["manifests"].Children.Find(x => x.Name != "local");
 
-                    if (branch == null || !ulong.TryParse(branch.Value, out request.ManifestID))
+                    if (branch == null || !ulong.TryParse(branch.Value, out request.ManifestId))
                     {
-                        await db.ExecuteAsync("INSERT INTO `Depots` (`DepotID`, `Name`) VALUES (@DepotID, @DepotName) ON DUPLICATE KEY UPDATE `DepotID` = VALUES(`DepotID`)", new { request.DepotID, request.DepotName });
+                        await db.ExecuteAsync("INSERT INTO `Depots` (`DepotID`, `Name`) VALUES (@DepotID, @DepotName) ON DUPLICATE KEY UPDATE `DepotID` = VALUES(`DepotID`)", new { DepotID = request.DepotId, request.DepotName });
 
                         continue;
                     }
 
-                    Log.WriteDebug(nameof(DepotProcessor), $"Depot {request.DepotID} (from {appID}) has no public branch, but there is another one");
+                    Log.WriteDebug(nameof(DepotProcessor), $"Depot {request.DepotId} (from {appID}) has no public branch, but there is another one");
 
-                    request.BuildID = depots["branches"][branch.Name]["buildid"].AsInteger();
+                    request.BuildId = depots["branches"][branch.Name]["buildid"].AsInteger();
                 }
                 else
                 {
-                    request.BuildID = depots["branches"]["public"]["buildid"].AsInteger();
+                    request.BuildId = depots["branches"]["public"]["buildid"].AsInteger();
                 }
 
                 requests.Add(request);
@@ -259,7 +260,7 @@ namespace SteamDatabaseBackend
 
             var depotsToDownload = new List<ManifestJob>();
 
-            var depotIds = requests.Select(x => x.DepotID).ToList();
+            var depotIds = requests.Select(x => x.DepotId).ToList();
             var dbDepots = (await db.QueryAsync<Depot>("SELECT `DepotID`, `Name`, `BuildID`, `ManifestID`, `LastManifestID`, `FilenamesEncrypted` FROM `Depots` WHERE `DepotID` IN @depotIds", new { depotIds }))
                 .ToDictionary(x => x.DepotID, x => x);
 
@@ -270,69 +271,69 @@ namespace SteamDatabaseBackend
             {
                 Depot dbDepot;
 
-                decryptionKeys.TryGetValue(request.DepotID, out request.DepotKey);
+                decryptionKeys.TryGetValue(request.DepotId, out request.DepotKey);
 
-                if (dbDepots.ContainsKey(request.DepotID))
+                if (dbDepots.ContainsKey(request.DepotId))
                 {
-                    dbDepot = dbDepots[request.DepotID];
+                    dbDepot = dbDepots[request.DepotId];
 
-                    if (dbDepot.BuildID > request.BuildID)
+                    if (dbDepot.BuildID > request.BuildId)
                     {
                         // buildid went back in time? this either means a rollback, or a shared depot that isn't synced properly
 
-                        Log.WriteDebug(nameof(DepotProcessor), $"Skipping depot {request.DepotID} due to old buildid: {dbDepot.BuildID} > {request.BuildID}");
+                        Log.WriteDebug(nameof(DepotProcessor), $"Skipping depot {request.DepotId} due to old buildid: {dbDepot.BuildID} > {request.BuildId}");
 
                         continue;
                     }
 
-                    if (dbDepot.LastManifestID == request.ManifestID
-                    && dbDepot.ManifestID == request.ManifestID
+                    if (dbDepot.LastManifestID == request.ManifestId
+                    && dbDepot.ManifestID == request.ManifestId
                     && Settings.FullRun != FullRunState.WithForcedDepots
                     && !dbDepot.FilenamesEncrypted && request.DepotKey != null)
                     {
                         // Update depot name if changed
                         if (request.DepotName != dbDepot.Name)
                         {
-                            await db.ExecuteAsync("UPDATE `Depots` SET `Name` = @DepotName WHERE `DepotID` = @DepotID", new { request.DepotID, request.DepotName });
+                            await db.ExecuteAsync("UPDATE `Depots` SET `Name` = @DepotName WHERE `DepotID` = @DepotID", new { DepotID = request.DepotId, request.DepotName });
                         }
 
                         continue;
                     }
 
                     request.StoredFilenamesEncrypted = dbDepot.FilenamesEncrypted;
-                    request.LastManifestID = dbDepot.LastManifestID;
+                    request.LastManifestId = dbDepot.LastManifestID;
                 }
                 else
                 {
                     dbDepot = new Depot();
                 }
 
-                if (dbDepot.BuildID != request.BuildID || dbDepot.ManifestID != request.ManifestID || request.DepotName != dbDepot.Name)
+                if (dbDepot.BuildID != request.BuildId || dbDepot.ManifestID != request.ManifestId || request.DepotName != dbDepot.Name)
                 {
                     await db.ExecuteAsync(@"INSERT INTO `Depots` (`DepotID`, `Name`, `BuildID`, `ManifestID`) VALUES (@DepotID, @DepotName, @BuildID, @ManifestID)
                                 ON DUPLICATE KEY UPDATE `LastUpdated` = CURRENT_TIMESTAMP(), `Name` = VALUES(`Name`), `BuildID` = VALUES(`BuildID`), `ManifestID` = VALUES(`ManifestID`)",
                     new
                     {
-                        request.DepotID,
+                        DepotID = request.DepotId,
                         request.DepotName,
-                        request.BuildID,
-                        request.ManifestID
+                        BuildID = request.BuildId,
+                        ManifestID = request.ManifestId
                     });
                 }
 
-                if (dbDepot.ManifestID != request.ManifestID)
+                if (dbDepot.ManifestID != request.ManifestId)
                 {
-                    await MakeHistory(db, null, request, string.Empty, "manifest_change", dbDepot.ManifestID, request.ManifestID);
+                    await MakeHistory(db, null, request, string.Empty, "manifest_change", dbDepot.ManifestID, request.ManifestId);
                 }
 
-                if (Settings.Current.OnlyOwnedDepots && !LicenseList.OwnedDepots.ContainsKey(request.DepotID))
+                if (Settings.Current.OnlyOwnedDepots && !LicenseList.OwnedDepots.ContainsKey(request.DepotId))
                 {
                     continue;
                 }
 
                 lock (DepotLocks)
                 {
-                    DepotLocks.Add(request.DepotID, 1);
+                    DepotLocks.Add(request.DepotId, 1);
                 }
 
                 depotsToDownload.Add(request);
@@ -346,7 +347,7 @@ namespace SteamDatabaseBackend
 
                     foreach (var depot in depotsToDownload)
                     {
-                        RemoveLock(depot.DepotID);
+                        RemoveLock(depot.DepotId);
                     }
                 }, TaskContinuationOptions.OnlyOnFaulted);
             }
@@ -354,7 +355,7 @@ namespace SteamDatabaseBackend
 
         private static async Task GetDepotDecryptionKey(SteamApps instance, ManifestJob depot, uint appID)
         {
-            var task = instance.GetDepotDecryptionKey(depot.DepotID, appID);
+            var task = instance.GetDepotDecryptionKey(depot.DepotId, appID);
             task.Timeout = TimeSpan.FromMinutes(15);
 
             SteamApps.DepotKeyCallback callback;
@@ -365,7 +366,7 @@ namespace SteamDatabaseBackend
             }
             catch (TaskCanceledException)
             {
-                Log.WriteWarn(nameof(DepotProcessor), $"Decryption key timed out for {depot.DepotID}");
+                Log.WriteWarn(nameof(DepotProcessor), $"Decryption key timed out for {depot.DepotId}");
 
                 return;
             }
@@ -374,22 +375,33 @@ namespace SteamDatabaseBackend
             {
                 if (callback.Result != EResult.AccessDenied)
                 {
-                    Log.WriteWarn(nameof(DepotProcessor), $"No access to depot {depot.DepotID} ({callback.Result})");
+                    Log.WriteWarn(nameof(DepotProcessor), $"No access to depot {depot.DepotId} ({callback.Result})");
                 }
 
                 return;
             }
 
-            Log.WriteDebug(nameof(DepotProcessor), $"Got a new depot key for depot {depot.DepotID}");
+            Log.WriteDebug(nameof(DepotProcessor), $"Got a new depot key for depot {depot.DepotId}");
 
             await using (var db = await Database.GetConnectionAsync())
             {
-                await db.ExecuteAsync("INSERT INTO `DepotsKeys` (`DepotID`, `Key`) VALUES (@DepotID, @Key) ON DUPLICATE KEY UPDATE `Key` = VALUES(`Key`)", new { depot.DepotID, Key = Utils.ByteArrayToString(callback.DepotKey) });
+                await db.ExecuteAsync("INSERT INTO `DepotsKeys` (`DepotID`, `Key`) VALUES (@DepotID, @Key) ON DUPLICATE KEY UPDATE `Key` = VALUES(`Key`)", new { DepotID = depot.DepotId, Key = Utils.ByteArrayToString(callback.DepotKey) });
             }
 
             depot.DepotKey = callback.DepotKey;
         }
+        public SteamContent steamContent;
+        public async Task<ulong> GetDepotManifestRequestCodeAsync(uint depotId, uint appId, ulong manifestId, string branch)
+        {
+            steamContent = Steam.Instance.Client.GetHandler<SteamContent>();
+            var requestCode = await steamContent.GetManifestRequestCode(depotId, appId, manifestId, branch);
 
+            Console.WriteLine("Got manifest request code for {0} {1} result: {2}",
+                depotId, manifestId,
+                requestCode);
+
+            return requestCode;
+        }
         private async Task DownloadDepots(uint appID, List<ManifestJob> depots)
         {
             Log.WriteDebug(nameof(DepotProcessor), $"Will process {depots.Count} depots from app {appID} ({DepotLocks.Count} depot locks left)");
@@ -405,10 +417,10 @@ namespace SteamDatabaseBackend
                     await GetDepotDecryptionKey(Steam.Instance.Apps, depot, appID);
 
                     if (depot.DepotKey == null
-                    && depot.LastManifestID == depot.ManifestID
+                    && depot.LastManifestId == depot.ManifestId
                     && Settings.FullRun != FullRunState.WithForcedDepots)
                     {
-                        RemoveLock(depot.DepotID);
+                        RemoveLock(depot.DepotId);
 
                         continue;
                     }
@@ -419,13 +431,16 @@ namespace SteamDatabaseBackend
                 DepotManifest depotManifest = null;
                 var lastError = string.Empty;
 
+                ulong manifestRequestCode = 0;
+                var manifestRequestCodeExpiration = DateTime.MinValue;
+                
+                manifestRequestCode = await GetDepotManifestRequestCodeAsync(depot.DepotId, appID, depot.ManifestId, "public");
                 for (var i = 0; i <= 5; i++)
                 {
                     try
                     {
                         await ManifestDownloadSemaphore.WaitAsync(TaskManager.TaskCancellationToken.Token).ConfigureAwait(false);
-
-                        depotManifest = await CDNClient.DownloadManifestAsync(depot.DepotID, depot.ManifestID, depot.Server, string.Empty, depot.DepotKey);
+                        depotManifest = await CDNClient.DownloadManifestAsync(depot.DepotId, depot.ManifestId, manifestRequestCode, depot.Server, depot.DepotKey, null);
 
                         break;
                     }
@@ -433,7 +448,7 @@ namespace SteamDatabaseBackend
                     {
                         lastError = e.Message;
 
-                        Log.WriteError(nameof(DepotProcessor), $"Failed to download depot manifest for app {appID} depot {depot.DepotID} ({depot.Server}: {lastError}) (#{i})");
+                        Log.WriteError(nameof(DepotProcessor), $"Failed to download depot manifest for app {appID} depot {depot.DepotId} ({depot.Server}: {lastError}) (#{i})");
                     }
                     finally
                     {
@@ -455,9 +470,9 @@ namespace SteamDatabaseBackend
 
                 if (depotManifest == null)
                 {
-                    RemoveLock(depot.DepotID);
+                    RemoveLock(depot.DepotId);
 
-                    if (FileDownloader.IsImportantDepot(depot.DepotID))
+                    if (FileDownloader.IsImportantDepot(depot.DepotId))
                     {
                         IRC.Instance.SendOps($"{Colors.OLIVE}[{depot.DepotName}]{Colors.NORMAL} Failed to download manifest ({lastError})");
                     }
@@ -474,7 +489,7 @@ namespace SteamDatabaseBackend
 
                 processTasks.Add(task);
 
-                if (!FileDownloader.IsImportantDepot(depot.DepotID) || depot.DepotKey == null)
+                if (!FileDownloader.IsImportantDepot(depot.DepotId) || depot.DepotKey == null)
                 {
                     depot.Result = EResult.Ignored;
                     continue;
@@ -497,10 +512,10 @@ namespace SteamDatabaseBackend
                     }
                     catch (Exception e)
                     {
-                        ErrorReporter.Notify($"Depot Processor {depot.DepotID}", e);
+                        ErrorReporter.Notify($"Depot Processor {depot.DepotId}", e);
                     }
 
-                    return (depot.DepotID, result);
+                    return (DepotID: depot.DepotId, result);
                 });
 
                 processTasks.Add(task);
@@ -531,26 +546,26 @@ namespace SteamDatabaseBackend
                 {
                     if (depot.Result == EResult.OK)
                     {
-                        RunUpdateScript(UpdateScript, $"{depot.DepotID} no-git");
+                        RunUpdateScript(UpdateScript, $"{depot.DepotId} no-git");
                     }
                     else if (depot.Result != EResult.Ignored)
                     {
-                        Log.WriteWarn(nameof(DepotProcessor), $"Download failed for {depot.DepotID}: {depot.Result}");
+                        Log.WriteWarn(nameof(DepotProcessor), $"Download failed for {depot.DepotId}: {depot.Result}");
 
                         RemoveErroredServer(depot.Server);
 
                         // Mark this depot for redownload
                         using var db = Database.Get();
-                        db.Execute("UPDATE `Depots` SET `LastManifestID` = 0 WHERE `DepotID` = @DepotID", new { depot.DepotID });
+                        db.Execute("UPDATE `Depots` SET `LastManifestID` = 0 WHERE `DepotID` = @DepotID", new { DepotID = depot.DepotId });
                     }
 
-                    RemoveLock(depot.DepotID);
+                    RemoveLock(depot.DepotId);
                 }
 
                 // Only commit changes if all depots downloaded
                 if (processTasks.All(x => x.Result.Result == EResult.OK || x.Result.Result == EResult.Ignored))
                 {
-                    if (!RunUpdateScriptForApp(appID, depots[0].BuildID))
+                    if (!RunUpdateScriptForApp(appID, depots[0].BuildId))
                     {
                         RunUpdateScript(UpdateScript, "0");
                     }
@@ -607,8 +622,8 @@ namespace SteamDatabaseBackend
         {
             if (depotManifest.FilenamesEncrypted && request.DepotKey != null)
             {
-                Log.WriteError(nameof(DepotProcessor), $"Depot key for depot {request.DepotID} is invalid?");
-                IRC.Instance.SendOps($"[Tokens] Looks like the depot key for depot {request.DepotID} is invalid");
+                Log.WriteError(nameof(DepotProcessor), $"Depot key for depot {request.DepotId} is invalid?");
+                IRC.Instance.SendOps($"[Tokens] Looks like the depot key for depot {request.DepotId} is invalid");
             }
 
             await using var db = await Database.GetConnectionAsync();
@@ -617,18 +632,18 @@ namespace SteamDatabaseBackend
             var result = await ProcessDepotAfterDownload(db, transaction, request, depotManifest);
             await transaction.CommitAsync();
 
-            return (request.DepotID, result);
+            return (request.DepotId, result);
         }
 
         private static async Task<EResult> ProcessDepotAfterDownload(IDbConnection db, IDbTransaction transaction, ManifestJob request, DepotManifest depotManifest)
         {
-            var filesOld = (await db.QueryAsync<DepotFile>("SELECT `File`, `Hash`, `Size`, `Flags` FROM `DepotsFiles` WHERE `DepotID` = @DepotID", new { request.DepotID }, transaction)).ToDictionary(x => x.File, x => x);
+            var filesOld = (await db.QueryAsync<DepotFile>("SELECT `File`, `Hash`, `Size`, `Flags` FROM `DepotsFiles` WHERE `DepotID` = @DepotID", new { DepotID = request.DepotId }, transaction)).ToDictionary(x => x.File, x => x);
             var filesAdded = new List<DepotFile>();
             var shouldHistorize = filesOld.Count > 0 && !depotManifest.FilenamesEncrypted; // Don't historize file additions if we didn't have any data before
 
             if (request.StoredFilenamesEncrypted && !depotManifest.FilenamesEncrypted)
             {
-                Log.WriteInfo(nameof(DepotProcessor), $"Depot {request.DepotID} will decrypt stored filenames");
+                Log.WriteInfo(nameof(DepotProcessor), $"Depot {request.DepotId} will decrypt stored filenames");
 
                 var decryptedFilesOld = new Dictionary<string, DepotFile>();
 
@@ -641,7 +656,7 @@ namespace SteamDatabaseBackend
 
                     await db.ExecuteAsync("UPDATE `DepotsFiles` SET `File` = @File WHERE `DepotID` = @DepotID AND `File` = @OldFile", new
                     {
-                        request.DepotID,
+                        DepotID = request.DepotId,
                         file.File,
                         OldFile = oldFile
                     }, transaction);
@@ -704,7 +719,7 @@ namespace SteamDatabaseBackend
                     {
                         await db.ExecuteAsync("UPDATE `DepotsFiles` SET `Hash` = @Hash, `Size` = @Size, `Flags` = @Flags WHERE `DepotID` = @DepotID AND `File` = @File", new DepotFile
                         {
-                            DepotID = request.DepotID,
+                            DepotID = request.DepotId,
                             File = name,
                             Hash = hash,
                             Size = file.TotalSize,
@@ -719,7 +734,7 @@ namespace SteamDatabaseBackend
                     // We want to historize modifications first, and only then deletions and additions
                     filesAdded.Add(new DepotFile
                     {
-                        DepotID = request.DepotID,
+                        DepotID = request.DepotId,
                         Hash = hash,
                         File = name,
                         Size = file.TotalSize,
@@ -738,7 +753,7 @@ namespace SteamDatabaseBackend
                     await db.ExecuteAsync("DELETE FROM `DepotsFiles` WHERE `DepotID` = @DepotID AND `File` IN @Files",
                         new
                         {
-                            request.DepotID,
+                            DepotID = request.DepotId,
                             Files = filesOldChunk,
                         }, transaction);
                 }
@@ -747,8 +762,8 @@ namespace SteamDatabaseBackend
                 {
                     await db.ExecuteAsync(HistoryQuery, filesOld.Select(x => new DepotHistory
                     {
-                        DepotID = request.DepotID,
-                        ManifestID = request.ManifestID,
+                        DepotID = request.DepotId,
+                        ManifestID = request.ManifestId,
                         ChangeID = request.ChangeNumber,
                         Action = "removed",
                         File = x.Value.File,
@@ -765,8 +780,8 @@ namespace SteamDatabaseBackend
                 {
                     await db.ExecuteAsync(HistoryQuery, filesAdded.Select(x => new DepotHistory
                     {
-                        DepotID = request.DepotID,
-                        ManifestID = request.ManifestID,
+                        DepotID = request.DepotId,
+                        ManifestID = request.ManifestId,
                         ChangeID = request.ChangeNumber,
                         Action = "added",
                         File = x.File,
@@ -776,13 +791,13 @@ namespace SteamDatabaseBackend
             }
 
             await db.ExecuteAsync(
-                request.LastManifestID == request.ManifestID ?
+                request.LastManifestId == request.ManifestId ?
                     "UPDATE `Depots` SET `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed WHERE `DepotID` = @DepotID" :
                     "UPDATE `Depots` SET `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed, `LastUpdated` = CURRENT_TIMESTAMP() WHERE `DepotID` = @DepotID",
                 new
                 {
-                    request.DepotID,
-                    request.ManifestID,
+                    DepotID = request.DepotId,
+                    ManifestID = request.ManifestId,
                     depotManifest.FilenamesEncrypted,
                     ManifestDate = depotManifest.CreationTime,
                     SizeOriginal = depotManifest.TotalUncompressedSize,
@@ -867,8 +882,8 @@ namespace SteamDatabaseBackend
             return db.ExecuteAsync(HistoryQuery,
                 new DepotHistory
                 {
-                    DepotID = request.DepotID,
-                    ManifestID = request.ManifestID,
+                    DepotID = request.DepotId,
+                    ManifestID = request.ManifestId,
                     ChangeID = request.ChangeNumber,
                     Action = action,
                     File = file,
@@ -890,7 +905,7 @@ namespace SteamDatabaseBackend
             }
         }
 
-        private void RemoveErroredServer(CDNClient.Server server)
+        private void RemoveErroredServer(Server server)
         {
             if (CDNServers.Count < 10)
             {
@@ -909,7 +924,7 @@ namespace SteamDatabaseBackend
             }
         }
 
-        private CDNClient.Server GetContentServer()
+        private Server GetContentServer()
         {
             var i = Utils.NextRandom(CDNServers.Count);
 

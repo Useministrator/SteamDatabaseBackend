@@ -184,13 +184,13 @@ namespace SteamDatabaseBackend
         public static SteamApps.PICSRequest NewAppRequest(uint id)
         {
             AppTokens.TryGetValue(id, out var token);
-            return new SteamApps.PICSRequest(id, token, false);
+            return new SteamApps.PICSRequest(id, token);
         }
 
         public static SteamApps.PICSRequest NewPackageRequest(uint id)
         {
             PackageTokens.TryGetValue(id, out var token);
-            return new SteamApps.PICSRequest(id, token, false);
+            return new SteamApps.PICSRequest(id, token);
         }
 
         public static SteamApps.PICSRequest NewAppRequest(uint id, ulong accessToken)
@@ -200,7 +200,7 @@ namespace SteamDatabaseBackend
                 HandleAppToken(id, accessToken);
             }
 
-            return new SteamApps.PICSRequest(id, accessToken, false);
+            return new SteamApps.PICSRequest(id, accessToken);
         }
 
         public static SteamApps.PICSRequest NewPackageRequest(uint id, ulong accessToken)
@@ -210,7 +210,7 @@ namespace SteamDatabaseBackend
                 HandlePackageToken(id, accessToken);
             }
 
-            return new SteamApps.PICSRequest(id, accessToken, false);
+            return new SteamApps.PICSRequest(id, accessToken);
         }
     }
 }

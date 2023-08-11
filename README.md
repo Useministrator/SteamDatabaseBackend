@@ -7,7 +7,7 @@ This source code is provided as-is for reference. It is highly tuned for SteamDB
 If you plan on running this yourself, keep in mind that we won't provide support for it.
 
 ## Requirements
-* [.NET 5+](https://dot.net)
+* [.NET 7+](https://dot.net)
 * [MySQL](https://www.mysql.com/) or [MariaDB](https://mariadb.org/) server
 
 ## Installation
