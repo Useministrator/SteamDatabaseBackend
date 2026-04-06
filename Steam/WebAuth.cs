@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Dapper;
@@ -19,6 +20,7 @@ namespace SteamDatabaseBackend
     internal class WebAuth : SteamHandler
     {
         private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+        private const string SessionIdCookieName = "sessionid";
         private static readonly string[] WebAuthDomains = ["store.steampowered.com", "steamcommunity.com"];
         private static readonly SemaphoreSlim AuthenticationSemaphore = new SemaphoreSlim(1, 1);
         private static readonly HttpClient WebHttpClient = CreateWebHttpClient();
@@ -156,6 +158,25 @@ namespace SteamDatabaseBackend
             return client;
         }
 
+        private static List<KeyValuePair<string, string>> PrepareFormData(HttpMethod method, Uri uri, IEnumerable<KeyValuePair<string, string>> data)
+        {
+            if (data == null && method == HttpMethod.Get)
+            {
+                return null;
+            }
+
+            var formData = data?.ToList() ?? new List<KeyValuePair<string, string>>();
+            var sessionId = Cookies.GetCookies(uri)[SessionIdCookieName]?.Value;
+
+            if (!string.IsNullOrWhiteSpace(sessionId))
+            {
+                formData.RemoveAll(pair => pair.Key == SessionIdCookieName);
+                formData.Add(new KeyValuePair<string, string>(SessionIdCookieName, sessionId));
+            }
+
+            return formData.Count > 0 ? formData : null;
+        }
+
         public static async Task<HttpResponseMessage> PerformRequest(HttpMethod method, Uri uri, IEnumerable<KeyValuePair<string, string>> data = null)
         {
             HttpResponseMessage response = null;
@@ -177,9 +198,11 @@ namespace SteamDatabaseBackend
                 using var requestMessage = new HttpRequestMessage(method, uri);
                 requestMessage.Headers.Add("Cookie", cookies); // Can't pass cookie container into a single req message
 
-                if (data != null)
+                var formData = PrepareFormData(method, uri, data);
+
+                if (formData != null)
                 {
-                    requestMessage.Content = new FormUrlEncodedContent(data);
+                    requestMessage.Content = new FormUrlEncodedContent(formData);
                 }
 
                 response = await WebHttpClient.SendAsync(requestMessage);

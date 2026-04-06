@@ -9,8 +9,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
-using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Timers;
 using Dapper;
@@ -29,13 +27,8 @@ namespace SteamDatabaseBackend
         private static int AppsRequestedInHour;
         private static Timer FreeLicenseTimer;
 
-        private bool CurrentlyUpdatingNames;
-        private readonly Regex PackageRegex;
-
         public FreeLicense(CallbackManager manager)
         {
-            PackageRegex = new Regex("RemoveFreeLicense\\( ?(?<subid>[0-9]+), ?'(?<name>.+)' ?\\)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.ExplicitCapture);
-
             manager.Subscribe<SteamApps.FreeLicenseCallback>(OnFreeLicenseCallback);
 
             FreeLicenseTimer = new Timer
@@ -126,68 +119,50 @@ namespace SteamDatabaseBackend
                         Packages = packageIDs.ToList()
                     });
 
-                TaskManager.Run(RefreshPackageNames);
+                TaskManager.Run(async () => await RefreshPackageNamesFromPackageInfo(packageIDs.ToList()));
             }
         }
 
-        private async Task RefreshPackageNames()
+        private async Task RefreshPackageNamesFromPackageInfo(IReadOnlyCollection<uint> packageIDs)
         {
-            if (CurrentlyUpdatingNames)
+            if (packageIDs.Count == 0)
             {
                 return;
             }
 
-            string data;
+            var unresolvedPackages = packageIDs.ToHashSet();
 
-            try
+            for (var attempt = 0; attempt < 5 && unresolvedPackages.Count > 0; attempt++)
             {
-                CurrentlyUpdatingNames = true;
-
-                var response = await WebAuth.PerformRequest(HttpMethod.Get, new Uri("https://store.steampowered.com/account/licenses/"));
-                data = await response.Content.ReadAsStringAsync();
-            }
-            catch (Exception e)
-            {
-                Log.WriteError(nameof(FreeLicense), $"Failed to fetch account details page: {e.Message}");
-
-                return;
-            }
-            finally
-            {
-                CurrentlyUpdatingNames = false;
-            }
-
-            var matches = PackageRegex.Matches(data);
-            var names = new Dictionary<uint, string>();
-
-            foreach (Match match in matches)
-            {
-                var subID = uint.Parse(match.Groups["subid"].Value);
-                var name = Encoding.UTF8.GetString(Convert.FromBase64String(match.Groups["name"].Value));
-
-                names[subID] = name;
-            }
-
-            if (names.Count == 0)
-            {
-                Log.WriteError(nameof(FreeLicense), "Failed to find any package names on licenses page");
-
-                return;
-            }
-
-            // Skip packages that have a store name to avoid messing up history
-            await using var db = await Database.GetConnectionAsync();
-            var packageData = await db.QueryAsync<Package>("SELECT `SubID`, `LastKnownName` FROM `Subs` WHERE `SubID` IN @Ids AND `StoreName` = ''", new { Ids = names.Keys });
-
-            foreach (var package in packageData)
-            {
-                var newName = names[package.SubID];
-
-                if (package.LastKnownName != newName)
+                if (attempt == 0)
                 {
-                    Log.WriteInfo(nameof(FreeLicense), $"Changed package name for {package.SubID} from \"{package.LastKnownName}\" to \"{newName}\"");
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                }
+                else
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1));
+                }
 
-                    await db.ExecuteAsync("UPDATE `Subs` SET `LastKnownName` = @Name WHERE `SubID` = @SubID", new { package.SubID, Name = newName });
+                await using var db = await Database.GetConnectionAsync();
+                var packageData = (await db.QueryAsync<Package>("SELECT `SubID`, `Name`, `LastKnownName` FROM `Subs` WHERE `SubID` IN @Ids AND `StoreName` = ''", new { Ids = unresolvedPackages })).ToList();
+
+                foreach (var package in packageData)
+                {
+                    if (!HasResolvedPackageName(package))
+                    {
+                        continue;
+                    }
+
+                    unresolvedPackages.Remove(package.SubID);
+
+                    if (package.LastKnownName == package.Name)
+                    {
+                        continue;
+                    }
+
+                    Log.WriteInfo(nameof(FreeLicense), $"Changed package name for {package.SubID} from \"{package.LastKnownName}\" to \"{package.Name}\" using package metadata");
+
+                    await db.ExecuteAsync("UPDATE `Subs` SET `LastKnownName` = @Name WHERE `SubID` = @SubID", new { package.SubID, Name = package.Name });
 
                     await db.ExecuteAsync(
                         SubProcessor.HistoryQuery,
@@ -195,13 +170,25 @@ namespace SteamDatabaseBackend
                         {
                             ID = package.SubID,
                             Key = SteamDB.DatabaseNameType,
-                            OldValue = "free on demand; account page",
-                            NewValue = newName,
+                            OldValue = "free on demand; package metadata",
+                            NewValue = package.Name,
                             Action = "created_info"
                         }
                     );
                 }
             }
+
+            if (unresolvedPackages.Count > 0)
+            {
+                Log.WriteDebug(nameof(FreeLicense), $"Package names are still unresolved after waiting for package metadata: {string.Join(", ", unresolvedPackages)}");
+            }
+        }
+
+        private static bool HasResolvedPackageName(Package package)
+        {
+            return !string.IsNullOrWhiteSpace(package.Name)
+                && !string.Equals(package.Name, "SteamDB Unknown Package", StringComparison.Ordinal)
+                && !package.Name.StartsWith("Steam Sub ", StringComparison.Ordinal);
         }
 
         private void OnTimer(object sender, ElapsedEventArgs e)
@@ -281,11 +268,7 @@ namespace SteamDatabaseBackend
                 {
                     var response = await WebAuth.PerformRequest(
                         HttpMethod.Post,
-                        new Uri($"https://store.steampowered.com/ajaxrequestplaytestaccess/{appId}"),
-                        new List<KeyValuePair<string, string>>
-                        {
-                            new KeyValuePair<string, string>("sessionid", nameof(SteamDatabaseBackend))
-                        }
+                        new Uri($"https://store.steampowered.com/ajaxrequestplaytestaccess/{appId}")
                     );
                     var data = await response.Content.ReadAsStringAsync();
 
