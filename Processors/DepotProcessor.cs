@@ -242,14 +242,15 @@ namespace SteamDatabaseBackend
                 var isPublic = branch.Name != null && branch.Name.Equals("public", StringComparison.OrdinalIgnoreCase);
 
                 await db.ExecuteAsync(isPublic ?
-                        "INSERT INTO `Builds` (`BuildID`, `ChangeID`, `AppID`, `Public`) VALUES (@BuildID, @ChangeNumber, @AppID, 1) ON DUPLICATE KEY UPDATE `ChangeID` = IF(`Public` = 0, VALUES(`ChangeID`), `ChangeID`), `Public` = 1"
+                        "INSERT INTO `Builds` (`BuildID`, `ChangeID`, `AppID`, `Public`, `BranchName`) VALUES (@BuildID, @ChangeNumber, @AppID, 1, @BranchName) ON DUPLICATE KEY UPDATE `ChangeID` = IF(`Public` = 0, VALUES(`ChangeID`), `ChangeID`), `Public` = 1, `BranchName` = \"public\""
                         :
-                        "INSERT INTO `Builds` (`BuildID`, `ChangeID`, `AppID`) VALUES (@BuildID, @ChangeNumber, @AppID) ON DUPLICATE KEY UPDATE `AppID` = `AppID`",
+                        "INSERT INTO `Builds` (`BuildID`, `ChangeID`, `AppID`, `Public`, `BranchName`) VALUES (@BuildID, @ChangeNumber, @AppID, 0, @BranchName) ON DUPLICATE KEY UPDATE `AppID` = `AppID`",
                     new
                     {
                         BuildID = buildId,
                         ChangeNumber = changeNumber,
                         AppID = appID,
+                        BranchName = isPublic ? "public" : branch.Name,
                     });
             }
 
