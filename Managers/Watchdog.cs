@@ -46,7 +46,7 @@ namespace SteamDatabaseBackend
 
                 Log.WriteWarn(nameof(Watchdog), "Forcing a Steam reconnect.");
 
-                Connection.Reconnect(null, null);
+                Connection.ScheduleReconnect("watchdog forced reconnect");
             }
 
             if (DateTime.Now.Subtract(Steam.Instance.DepotProcessor.LastServerRefreshTime).TotalHours >= 2.0)

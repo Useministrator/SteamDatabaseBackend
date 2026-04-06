@@ -14,6 +14,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Dapper;
 using SteamKit2;
+using SteamKit2.Authentication;
 
 namespace SteamDatabaseBackend
 {
@@ -95,6 +96,25 @@ namespace SteamDatabaseBackend
                 Log.WriteInfo(nameof(WebAuth), "Authenticated");
 
                 return true;
+            }
+            catch (AuthenticationException e) when (Connection.IsStoredRefreshTokenInvalidResult(e.Result))
+            {
+                IsAuthorized = false;
+                Cookies = new CookieContainer();
+
+                Log.WriteWarn(nameof(WebAuth), $"Stored refresh token was rejected during web auth: {e.Result}");
+
+                await Connection.RecoverFromExpiredRefreshTokenAsync("web auth refresh token was rejected", e.Result, disconnectClient: Steam.Instance.Client.IsConnected);
+
+                return false;
+            }
+            catch (AuthenticationException e)
+            {
+                IsAuthorized = false;
+
+                Log.WriteWarn(nameof(WebAuth), $"Failed to authenticate: {e.Result}");
+
+                return false;
             }
             catch (Exception e)
             {
