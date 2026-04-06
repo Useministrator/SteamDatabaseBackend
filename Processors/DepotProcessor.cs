@@ -31,6 +31,7 @@ namespace SteamDatabaseBackend
             public uint ChangeNumber;
             public uint DepotId;
             public int BuildId;
+            public string BranchName = "public";
             public ulong ManifestId;
             public ulong LastManifestId;
             public string DepotName;
@@ -195,18 +196,19 @@ namespace SteamDatabaseBackend
 
                 // SteamVR trickery
                 if (appID == 250820
-                    && depot["manifests"]["beta"].Value != null
+                    && TryGetManifestId(depot["manifests"]["beta"], out _)
                     && depots["branches"]["beta"]["buildid"].AsInteger() > depots["branches"]["public"]["buildid"].AsInteger())
                 {
+                    request.BranchName = "beta";
                     request.BuildId = depots["branches"]["beta"]["buildid"].AsInteger();
-                    request.ManifestId = ulong.Parse(depot["manifests"]["beta"].Value);
+                    request.ManifestId = ParseManifestId(depot["manifests"]["beta"]);
                 }
                 else
-                if (depot["manifests"]["public"].Value == null || !ulong.TryParse(depot["manifests"]["public"].Value, out request.ManifestId))
+                if (!TryGetManifestId(depot["manifests"]["public"], out request.ManifestId))
                 {
-                    var branch = depot["manifests"].Children.Find(x => x.Name != "local");
+                    var branch = depot["manifests"].Children.Find(x => x.Name != "local" && TryGetManifestId(x, out _));
 
-                    if (branch == null || !ulong.TryParse(branch.Value, out request.ManifestId))
+                    if (branch == null || !TryGetManifestId(branch, out request.ManifestId))
                     {
                         await db.ExecuteAsync("INSERT INTO `Depots` (`DepotID`, `Name`) VALUES (@DepotID, @DepotName) ON DUPLICATE KEY UPDATE `DepotID` = VALUES(`DepotID`)", new { DepotID = request.DepotId, request.DepotName });
 
@@ -215,10 +217,12 @@ namespace SteamDatabaseBackend
 
                     Log.WriteDebug(nameof(DepotProcessor), $"Depot {request.DepotId} (from {appID}) has no public branch, but there is another one");
 
+                    request.BranchName = branch.Name;
                     request.BuildId = depots["branches"][branch.Name]["buildid"].AsInteger();
                 }
                 else
                 {
+                    request.BranchName = "public";
                     request.BuildId = depots["branches"]["public"]["buildid"].AsInteger();
                 }
 
@@ -403,6 +407,36 @@ namespace SteamDatabaseBackend
 
             return requestCode;
         }
+
+        private static bool TryGetManifestId(KeyValue branch, out ulong manifestId)
+        {
+            manifestId = 0;
+
+            if (branch == KeyValue.Invalid)
+            {
+                return false;
+            }
+
+            if (branch.Value != null && ulong.TryParse(branch.Value, out manifestId))
+            {
+                return true;
+            }
+
+            var gid = branch["gid"];
+
+            return gid.Value != null && ulong.TryParse(gid.Value, out manifestId);
+        }
+
+        private static ulong ParseManifestId(KeyValue branch)
+        {
+            if (TryGetManifestId(branch, out var manifestId))
+            {
+                return manifestId;
+            }
+
+            throw new InvalidDataException($"Failed to parse manifest id from branch {branch.Name}");
+        }
+
         private async Task DownloadDepots(uint appID, List<ManifestJob> depots)
         {
             Log.WriteDebug(nameof(DepotProcessor), $"Will process {depots.Count} depots from app {appID} ({DepotLocks.Count} depot locks left)");
@@ -435,7 +469,7 @@ namespace SteamDatabaseBackend
                 ulong manifestRequestCode = 0;
                 var manifestRequestCodeExpiration = DateTime.MinValue;
                 
-                manifestRequestCode = await GetDepotManifestRequestCodeAsync(depot.DepotId, appID, depot.ManifestId, "public");
+                manifestRequestCode = await GetDepotManifestRequestCodeAsync(depot.DepotId, appID, depot.ManifestId, depot.BranchName);
                 for (var i = 0; i <= 5; i++)
                 {
                     try
