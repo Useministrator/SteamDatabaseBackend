@@ -17,14 +17,14 @@ namespace SteamDatabaseBackend
 {
     internal class PubFileCommand : Command
     {
-        private readonly SteamUnifiedMessages.UnifiedService<IPublishedFile> PublishedFiles;
+        private readonly PublishedFile PublishedFiles;
 
         public PubFileCommand()
         {
             Trigger = "pubfile";
             IsSteamCommand = true;
 
-            PublishedFiles = Steam.Instance.UnifiedMessages.CreateService<IPublishedFile>();
+            PublishedFiles = Steam.Instance.UnifiedMessages.CreateService<PublishedFile>();
         }
 
         public override async Task OnCommand(CommandArguments command)
@@ -56,10 +56,10 @@ namespace SteamDatabaseBackend
 
             pubFileRequest.publishedfileids.Add(pubFileId);
 
-            var task = PublishedFiles.SendMessage(api => api.GetDetails(pubFileRequest));
+            var task = PublishedFiles.GetDetails(pubFileRequest);
             task.Timeout = TimeSpan.FromSeconds(10);
             var callback = await task;
-            var response = callback.GetDeserializedResponse<CPublishedFile_GetDetails_Response>();
+            var response = callback.Body;
             var details = response.publishedfiledetails.FirstOrDefault();
 
             if (details == null)

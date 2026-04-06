@@ -8,20 +8,19 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using SteamKit2;
-using SteamKit2.Internal;
 
 namespace SteamDatabaseBackend
 {
     internal class ServersCommand : Command
     {
-        private readonly SteamUnifiedMessages.UnifiedService<IGameServers> GameServers;
+        private readonly SteamMasterServer MasterServer;
 
         public ServersCommand()
         {
             Trigger = "servers";
             IsSteamCommand = true;
 
-            GameServers = Steam.Instance.UnifiedMessages.CreateService<IGameServers>();
+            MasterServer = Steam.Instance.MasterServer;
         }
 
         public override async Task OnCommand(CommandArguments command)
@@ -40,17 +39,16 @@ namespace SteamDatabaseBackend
                 return;
             }
 
-            var request = new CGameServers_GetServerList_Request
+            var request = new SteamMasterServer.QueryDetails
             {
-                filter = command.Message,
-                limit = int.MaxValue,
+                Filter = command.Message,
+                MaxServers = int.MaxValue,
+                Region = ERegionCode.World,
             };
 
-            var task = GameServers.SendMessage(api => api.GetServerList(request));
+            var task = MasterServer.ServerQuery(request);
             task.Timeout = TimeSpan.FromSeconds(10);
-            var callback = await task;
-            var response = callback.GetDeserializedResponse<CGameServers_GetServerList_Response>();
-            var servers = response.servers;
+            var servers = (await task).Servers;
 
             if (servers.Count == 0)
             {
@@ -63,12 +61,12 @@ namespace SteamDatabaseBackend
             {
                 var server = servers[0];
 
-                command.Reply($"{server.addr} - {new SteamID(server.steamid).Render()} - {Colors.GREEN}{server.players}/{server.max_players}{Colors.NORMAL} - Map: {Colors.DARKGRAY}{server.map}{Colors.NORMAL} - AppID: {Colors.DARKGRAY}{server.appid}{Colors.NORMAL} - Version: {Colors.DARKGRAY}{server.version}{Colors.NORMAL} - Dir: {Colors.DARKGRAY}{server.gamedir}{Colors.NORMAL} - Tags: {Colors.DARKGRAY}{server.gametype}{Colors.NORMAL} - Name: {Colors.DARKGRAY}{server.name}");
+                command.Reply($"{server.EndPoint} - {Colors.GREEN}{server.AuthedPlayers}{Colors.NORMAL} authenticated players");
 
                 return;
             }
 
-            command.Reply($"{Colors.GREEN}{servers.Sum(x => x.players)}{Colors.NORMAL} players on {Colors.GREEN}{servers.Count}{Colors.NORMAL} servers. First three: {string.Join(" / ", servers.Take(3).Select(x => x.addr))}");
+            command.Reply($"{Colors.GREEN}{servers.Sum(x => x.AuthedPlayers)}{Colors.NORMAL} authenticated players on {Colors.GREEN}{servers.Count}{Colors.NORMAL} servers. First three: {string.Join(" / ", servers.Take(3).Select(x => x.EndPoint))}");
         }
     }
 }

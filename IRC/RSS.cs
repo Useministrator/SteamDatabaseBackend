@@ -46,6 +46,12 @@ namespace SteamDatabaseBackend
 
         public RSS()
         {
+            if (Settings.Current.RssFeeds.Count == 0)
+            {
+                Log.WriteInfo(nameof(RSS), "RSS feeds are not configured");
+                return;
+            }
+
             Timer = new Timer();
             Timer.Elapsed += Tick;
             Timer.Interval = TimeSpan.FromSeconds(60).TotalMilliseconds;
@@ -65,6 +71,11 @@ namespace SteamDatabaseBackend
 
         private static async void Tick(object sender, ElapsedEventArgs e)
         {
+            if (Settings.Current.RssFeeds.Count == 0)
+            {
+                return;
+            }
+
             DateTime lastPostDate;
 
             await using (var db = await Database.GetConnectionAsync())
@@ -73,8 +84,13 @@ namespace SteamDatabaseBackend
             }
 
             var tasks = Settings.Current.RssFeeds.Select(uri => ProcessFeed(uri, lastPostDate));
-
             var dates = await Task.WhenAll(tasks);
+
+            if (dates.Length == 0)
+            {
+                return;
+            }
+
             var maxDate = dates.Max();
 
             if (maxDate > lastPostDate)

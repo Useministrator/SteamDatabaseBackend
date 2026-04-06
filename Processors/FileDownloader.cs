@@ -9,6 +9,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Buffers;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -237,7 +238,7 @@ namespace SteamDatabaseBackend
                         {
                             var oldData = new byte[chunk.UncompressedLength];
                             fsOld.Seek((long)oldChunk.Key, SeekOrigin.Begin);
-                            fsOld.Read(oldData, 0, oldData.Length);
+                            fsOld.ReadExactly(oldData, 0, oldData.Length);
 
                             var existingChecksum = sha.ComputeHash(oldData);
 
@@ -355,11 +356,20 @@ namespace SteamDatabaseBackend
 
                 try
                 {
-                    var chunkData = await CDNClient.DownloadDepotChunkAsync(job.DepotId, chunk, job.Server, job.DepotKey);
+                    var destination = ArrayPool<byte>.Shared.Rent((int)chunk.UncompressedLength);
 
-                    await using var fs = downloadPath.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-                    fs.Seek((long)chunk.Offset, SeekOrigin.Begin);
-                    await fs.WriteAsync(chunkData.Data);
+                    try
+                    {
+                        var bytesWritten = await CDNClient.DownloadDepotChunkAsync(job.DepotId, chunk, job.Server, destination, job.DepotKey);
+
+                        await using var fs = downloadPath.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                        fs.Seek((long)chunk.Offset, SeekOrigin.Begin);
+                        await fs.WriteAsync(destination.AsMemory(0, bytesWritten), chunkCancellation.Token);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(destination);
+                    }
 
                     return true;
                 }

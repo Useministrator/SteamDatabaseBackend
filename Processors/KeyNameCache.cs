@@ -4,7 +4,7 @@
  * found in the LICENSE file.
  */
 
-using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading.Tasks;
 using Dapper;
@@ -13,14 +13,14 @@ namespace SteamDatabaseBackend
 {
     internal static class KeyNameCache
     {
-        private static Dictionary<string, uint> App;
-        private static Dictionary<string, uint> Sub;
+        private static ConcurrentDictionary<string, uint> App;
+        private static ConcurrentDictionary<string, uint> Sub;
 
         public static async Task Init()
         {
             await using var db = await Database.GetConnectionAsync();
-            App = (await db.QueryAsync<KeyName>("SELECT `Name`, `ID` FROM `KeyNames`")).ToDictionary(x => x.Name, x => x.ID);
-            Sub = (await db.QueryAsync<KeyName>("SELECT `Name`, `ID` FROM `KeyNamesSubs`")).ToDictionary(x => x.Name, x => x.ID);
+            App = new ConcurrentDictionary<string, uint>((await db.QueryAsync<KeyName>("SELECT `Name`, `ID` FROM `KeyNames`")).ToDictionary(x => x.Name, x => x.ID));
+            Sub = new ConcurrentDictionary<string, uint>((await db.QueryAsync<KeyName>("SELECT `Name`, `ID` FROM `KeyNamesSubs`")).ToDictionary(x => x.Name, x => x.ID));
         }
 
         public static uint GetAppKeyID(string name)

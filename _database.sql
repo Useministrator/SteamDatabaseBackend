@@ -48,7 +48,8 @@ CREATE TABLE `Builds` (
   `ChangeID` int(10) unsigned NOT NULL,
   `AppID` int(10) unsigned NOT NULL,
   `Public` tinyint(1) NOT NULL DEFAULT 0,
-  PRIMARY KEY (`BuildID`),
+  `BranchName` varchar(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'public',
+  PRIMARY KEY (`BuildID`,`BranchName`),
   KEY `AppID` (`AppID`),
   KEY `Public` (`Public`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

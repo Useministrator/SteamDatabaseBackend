@@ -2,6 +2,9 @@ name: .NET Core CI
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: .NET on ${{ matrix.os }}
@@ -13,15 +16,16 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v5
 
-    - name: Setup .NET Core
-      uses: actions/setup-dotnet@v1
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v5
       with:
-        dotnet-version: 5.0.x
+        global-json-file: global.json
+        cache: true
 
     - name: Restore
-      run: dotnet restore
+      run: dotnet restore --locked-mode
 
     - name: Build
-      run: dotnet build -c Release
+      run: dotnet build SteamDatabaseBackend.sln -c Release --no-restore

@@ -25,6 +25,7 @@ namespace SteamDatabaseBackend
         public SteamFriends Friends { get; }
         public SteamUserStats UserStats { get; }
         public SteamUnifiedMessages UnifiedMessages { get; }
+        public SteamMasterServer MasterServer { get; }
         public CallbackManager CallbackManager { get; }
 
         public PICSChanges PICSChanges { get; }
@@ -57,6 +58,7 @@ namespace SteamDatabaseBackend
             Friends = Client.GetHandler<SteamFriends>();
             UserStats = Client.GetHandler<SteamUserStats>();
             UnifiedMessages = Client.GetHandler<SteamUnifiedMessages>();
+            MasterServer = Client.GetHandler<SteamMasterServer>();
 
             CallbackManager = new CallbackManager(Client);
 
