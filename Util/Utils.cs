@@ -106,28 +106,44 @@ namespace SteamDatabaseBackend
             return input.Substring(0, 100) + "…";
         }
 
-        public static EAppType GetAppType(string appType) => appType switch
+        public static EAppType GetAppType(string appType)
         {
-            "invalid"     => EAppType.Invalid,
-            "game"        => EAppType.Game,
-            "application" => EAppType.Application,
-            "tool"        => EAppType.Tool,
-            "demo"        => EAppType.Demo,
-            "media"       => EAppType.Media,
-            "dlc"         => EAppType.DLC,
-            "guide"       => EAppType.Guide,
-            "driver"      => EAppType.Driver,
-            "config"      => EAppType.Config,
-            "hardware"    => EAppType.Hardware,
-            "franchise"   => EAppType.Franchise,
-            "video"       => EAppType.Video,
-            "plugin"      => EAppType.Plugin,
-            "music"       => EAppType.MusicAlbum,
-            "series"      => EAppType.Series,
-            "comic"       => EAppType.Comic,
-            "beta"        => EAppType.Beta,
-            _             => throw new NotImplementedException($"Unimplemented apptype: {appType}"),
-        };
+            if (string.IsNullOrWhiteSpace(appType))
+            {
+                Log.WriteWarn(nameof(Utils), "Received an empty app type from Steam, falling back to invalid");
+                return EAppType.Invalid;
+            }
+
+            return appType switch
+            {
+                "invalid"     => EAppType.Invalid,
+                "game"        => EAppType.Game,
+                "application" => EAppType.Application,
+                "tool"        => EAppType.Tool,
+                "demo"        => EAppType.Demo,
+                "media"       => EAppType.Media,
+                "dlc"         => EAppType.DLC,
+                "guide"       => EAppType.Guide,
+                "driver"      => EAppType.Driver,
+                "config"      => EAppType.Config,
+                "hardware"    => EAppType.Hardware,
+                "franchise"   => EAppType.Franchise,
+                "video"       => EAppType.Video,
+                "plugin"      => EAppType.Plugin,
+                "music"       => EAppType.MusicAlbum,
+                "series"      => EAppType.Series,
+                "comic"       => EAppType.Comic,
+                "beta"        => EAppType.Beta,
+                _             => LogUnknownAppType(appType),
+            };
+        }
+
+        private static EAppType LogUnknownAppType(string appType)
+        {
+            Log.WriteWarn(nameof(Utils), $"Unknown app type from Steam: {appType}, falling back to invalid");
+
+            return EAppType.Invalid;
+        }
 
         public static string JsonifyKeyValue(KeyValue keys)
         {
