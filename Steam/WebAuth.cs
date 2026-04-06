@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2013-present, SteamDB. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
@@ -8,14 +8,21 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
-using System.Text;
+using System.Security.Cryptography;
+using System.Threading;
 using System.Threading.Tasks;
+using Dapper;
 using SteamKit2;
 
 namespace SteamDatabaseBackend
 {
     internal class WebAuth : SteamHandler
     {
+        private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+        private static readonly string[] WebAuthDomains = ["store.steampowered.com", "steamcommunity.com"];
+        private static readonly SemaphoreSlim AuthenticationSemaphore = new SemaphoreSlim(1, 1);
+        private static readonly HttpClient WebHttpClient = CreateWebHttpClient();
+
         public static bool IsAuthorized { get; private set; }
         private static CookieContainer Cookies = new CookieContainer();
 
@@ -26,77 +33,127 @@ namespace SteamDatabaseBackend
 
         private void OnLoggedOn(SteamUser.LoggedOnCallback callback)
         {
-            TaskManager.Run(AuthenticateUser);
+            IsAuthorized = false;
+            Cookies = new CookieContainer();
+
+            if (callback.Result != EResult.OK)
+            {
+                return;
+            }
+
+            TaskManager.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3));
+                await AuthenticateUser();
+            });
         }
 
         public static async Task<bool> AuthenticateUser()
         {
-            SteamUser.WebAPIUserNonceCallback nonce;
-            ulong steamid;
+            await AuthenticationSemaphore.WaitAsync();
 
             try
             {
-                nonce = await Steam.Instance.User.RequestWebAPIUserNonce();
-                steamid = Steam.Instance.Client.SteamID.ConvertToUInt64();
+                if (IsAuthorized)
+                {
+                    return true;
+                }
+
+                var refreshToken = await GetRefreshTokenAsync();
+
+                if (string.IsNullOrWhiteSpace(refreshToken) || refreshToken == "0")
+                {
+                    IsAuthorized = false;
+
+                    Log.WriteWarn(nameof(WebAuth), "Failed to authenticate: no refresh token available");
+
+                    return false;
+                }
+
+                var steamId = Steam.Instance.Client.SteamID;
+                var tokens = await Steam.Instance.Client.Authentication.GenerateAccessTokenForAppAsync(steamId, refreshToken, allowRenewal: true);
+
+                if (string.IsNullOrWhiteSpace(tokens.AccessToken))
+                {
+                    IsAuthorized = false;
+
+                    Log.WriteWarn(nameof(WebAuth), "Failed to authenticate: Steam did not return an access token");
+
+                    return false;
+                }
+
+                if (!string.IsNullOrWhiteSpace(tokens.RefreshToken) && !string.Equals(tokens.RefreshToken, refreshToken, StringComparison.Ordinal))
+                {
+                    await LocalConfig.Update("backend.loginkey", tokens.RefreshToken);
+                }
+
+                Cookies = CreateCookies(steamId.ConvertToUInt64(), tokens.AccessToken);
+                IsAuthorized = true;
+
+                Log.WriteInfo(nameof(WebAuth), "Authenticated");
+
+                return true;
             }
             catch (Exception e)
             {
                 IsAuthorized = false;
 
-                Log.WriteWarn(nameof(WebAuth), $"Failed to get nonce: {e.Message}");
+                Log.WriteWarn(nameof(WebAuth), $"Failed to authenticate: {e.Message}");
 
                 return false;
             }
-
-            // 32 byte random blob of data
-            var sessionKey = CryptoHelper.GenerateRandomBlock(32);
-
-            byte[] encryptedSessionKey;
-
-            // ... which is then encrypted with RSA using the Steam system's public key
-            using (var rsa = new RSACrypto(KeyDictionary.GetPublicKey(Steam.Instance.Client.Universe)!))
+            finally
             {
-                encryptedSessionKey = rsa.Encrypt(sessionKey);
+                AuthenticationSemaphore.Release();
+            }
+        }
+
+        private static CookieContainer CreateCookies(ulong steamId, string accessToken)
+        {
+            var cookies = new CookieContainer();
+            var steamLoginSecure = Uri.EscapeDataString($"{steamId}||{accessToken}");
+            var sessionId = Convert.ToHexString(GenerateRandomBlock(12)).ToLowerInvariant();
+            var clientSessionId = Convert.ToHexString(GenerateRandomBlock(8)).ToLowerInvariant();
+
+            foreach (var domain in WebAuthDomains)
+            {
+                cookies.Add(new Cookie("steamLoginSecure", steamLoginSecure, "/", domain));
+                cookies.Add(new Cookie("sessionid", sessionId, "/", domain));
+                cookies.Add(new Cookie("clientsessionid", clientSessionId, "/", domain));
             }
 
-            // users hashed loginkey, AES encrypted with the sessionkey
-            var encryptedLoginKey = CryptoHelper.SymmetricEncrypt(Encoding.ASCII.GetBytes(nonce.Nonce), sessionKey);
+            return cookies;
+        }
 
-            using (var userAuth = Steam.Configuration.GetAsyncWebAPIInterface("ISteamUserAuth"))
+        private static async Task<string> GetRefreshTokenAsync()
+        {
+            await using var db = await Database.GetConnectionAsync();
+
+            return await db.ExecuteScalarAsync<string>("SELECT `Value` FROM `LocalConfig` WHERE `ConfigKey` = 'backend.loginkey'");
+        }
+
+        private static byte[] GenerateRandomBlock(int length)
+        {
+            var bytes = new byte[length];
+            RandomNumberGenerator.Fill(bytes);
+
+            return bytes;
+        }
+
+        private static HttpClient CreateWebHttpClient()
+        {
+            var client = new HttpClient(new HttpClientHandler
             {
-                KeyValue result;
+                AllowAutoRedirect = false,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+            });
 
-                try
-                {
-                    result = await userAuth.CallAsync(HttpMethod.Post, "AuthenticateUser", 1,
-                        new Dictionary<string, object>
-                        {
-                            { "steamid", steamid },
-                            { "sessionkey", encryptedSessionKey },
-                            { "encrypted_loginkey", encryptedLoginKey },
-                        }
-                    );
-                }
-                catch (HttpRequestException e)
-                {
-                    IsAuthorized = false;
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
+            client.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+            client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+            client.Timeout = TimeSpan.FromSeconds(15);
 
-                    Log.WriteWarn(nameof(WebAuth), $"Failed to authenticate: {e.Message}");
-
-                    return false;
-                }
-
-                Cookies = new CookieContainer();
-                Cookies.Add(new Cookie("steamLogin", result["token"].AsString(), "/", "store.steampowered.com"));
-                Cookies.Add(new Cookie("steamLoginSecure", result["tokensecure"].AsString(), "/", "store.steampowered.com"));
-                Cookies.Add(new Cookie("sessionid", nameof(SteamDatabaseBackend), "/", "store.steampowered.com"));
-            }
-
-            IsAuthorized = true;
-
-            Log.WriteInfo(nameof(WebAuth), "Authenticated");
-
-            return true;
+            return client;
         }
 
         public static async Task<HttpResponseMessage> PerformRequest(HttpMethod method, Uri uri, IEnumerable<KeyValuePair<string, string>> data = null)
@@ -125,13 +182,14 @@ namespace SteamDatabaseBackend
                     requestMessage.Content = new FormUrlEncodedContent(data);
                 }
 
-                response = await Utils.HttpClient.SendAsync(requestMessage);
+                response = await WebHttpClient.SendAsync(requestMessage);
 
                 if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Redirect)
                 {
                     Log.WriteDebug(nameof(WebAuth), $"Got status code {response.StatusCode} for {uri}");
 
                     IsAuthorized = false;
+                    Cookies = new CookieContainer();
 
                     continue;
                 }

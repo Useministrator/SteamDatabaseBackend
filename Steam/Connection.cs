@@ -5,9 +5,8 @@
  */
 
 using System;
-using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
+using System.Threading.Tasks;
 using System.Timers;
 using Dapper;
 using SteamKit2;
@@ -17,6 +16,60 @@ namespace SteamDatabaseBackend
 {
     internal class Connection : SteamHandler, IDisposable
     {
+        private sealed class EnvironmentAwareAuthenticator : IAuthenticator
+        {
+            private static readonly string[] EmailCodeEnvironmentVariables =
+            [
+                "STEAM_GUARD_CODE",
+                "STEAM_EMAIL_CODE",
+            ];
+
+            private static readonly string[] DeviceCodeEnvironmentVariables =
+            [
+                "STEAM_GUARD_CODE",
+                "STEAM_TWO_FACTOR_CODE",
+            ];
+
+            public Task<bool> AcceptDeviceConfirmationAsync() => Task.FromResult(false);
+
+            public Task<string> GetDeviceCodeAsync(bool previousCodeWasIncorrect)
+            {
+                var prompt = previousCodeWasIncorrect
+                    ? "STEAM GUARD! The previous 2 factor auth code was incorrect. Please enter a new code from your authenticator app: "
+                    : "STEAM GUARD! Please enter your 2 factor auth code from your authenticator app: ";
+
+                return Task.FromResult(ReadCode(DeviceCodeEnvironmentVariables, prompt));
+            }
+
+            public Task<string> GetEmailCodeAsync(string email, bool previousCodeWasIncorrect)
+            {
+                var prompt = previousCodeWasIncorrect
+                    ? $"STEAM GUARD! The previous email code was incorrect. Please enter the auth code sent to the email at {email}: "
+                    : $"STEAM GUARD! Please enter the auth code sent to the email at {email}: ";
+
+                return Task.FromResult(ReadCode(EmailCodeEnvironmentVariables, prompt));
+            }
+
+            private static string ReadCode(string[] variableNames, string prompt)
+            {
+                foreach (var variableName in variableNames)
+                {
+                    var value = Environment.GetEnvironmentVariable(variableName);
+
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        Environment.SetEnvironmentVariable(variableName, null);
+
+                        return value.Trim();
+                    }
+                }
+
+                Console.Write(prompt);
+
+                return Console.ReadLine()?.Trim();
+            }
+        }
+
         public const uint RETRY_DELAY = 15;
 
         public static DateTime LastSuccessfulLogin { get; private set; }
@@ -39,7 +92,6 @@ namespace SteamDatabaseBackend
             manager.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
             manager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
             manager.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
-            manager.Subscribe<SteamUser.UpdateMachineAuthCallback>(OnMachineAuth);
             manager.Subscribe<SteamUser.SessionTokenCallback>(OnSessionToken);
         }
 
@@ -65,7 +117,7 @@ namespace SteamDatabaseBackend
 
             await using var db = await Database.GetConnectionAsync();
             var config = (await db.QueryAsync<(string, string)>(
-                "SELECT `ConfigKey`, `Value` FROM `LocalConfig` WHERE `ConfigKey` IN ('backend.sentryhash', 'backend.loginkey')"
+                "SELECT `ConfigKey`, `Value` FROM `LocalConfig` WHERE `ConfigKey` IN ('backend.loginkey', 'backend.guarddata')"
             )).ToDictionary(x => x.Item1, x => x.Item2);
 
             Log.WriteInfo(nameof(Steam), "Connected, logging in...");
@@ -88,10 +140,17 @@ namespace SteamDatabaseBackend
                     Username = Settings.Current.Steam.Username,
                     Password = Settings.Current.Steam.Password,
                     IsPersistentSession = true,
-                    Authenticator = new UserConsoleAuthenticator(),
+                    GuardData = config.TryGetValue("backend.guarddata", out var guardData) ? guardData : null,
+                    Authenticator = new EnvironmentAwareAuthenticator(),
                 });
-                var result = await authSession.PollingWaitForResultAsync();     
+                var result = await authSession.PollingWaitForResultAsync();
                 accessToken = result.RefreshToken;
+
+                if (!string.IsNullOrWhiteSpace(result.NewGuardData))
+                {
+                    await LocalConfig.Update("backend.guarddata", result.NewGuardData);
+                }
+
                 await LocalConfig.Update("backend.loginkey", accessToken);
             }
 
@@ -101,13 +160,10 @@ namespace SteamDatabaseBackend
             {
                 AccessToken = accessToken,
                 Username = Settings.Current.Steam.Username,
-                Password = loginToken == null ? Settings.Current.Steam.Password : null,
+                Password = accessToken == null ? Settings.Current.Steam.Password : null,
                 AuthCode = IsTwoFactor ? null : AuthCode,
                 TwoFactorCode = IsTwoFactor ? AuthCode : null,
                 ShouldRememberPassword = true,
-                SentryFileHash = config.TryGetValue("backend.sentryhash", out var sentryHash)
-                    ? Utils.StringToByteArray(sentryHash)
-                    : null,
                 LoginID = 0x78_50_61_77,
             }; 
 
@@ -189,55 +245,11 @@ namespace SteamDatabaseBackend
             Log.WriteInfo(nameof(Steam), $"Logged out of Steam: {callback.Result}");
         }
 
-        private async void OnMachineAuth(SteamUser.UpdateMachineAuthCallback callback)
-        {
-            Log.WriteInfo(nameof(Steam), $"Updating sentry file... {callback.FileName}");
-
-            if (callback.Data.Length != callback.BytesToWrite)
-            {
-                ErrorReporter.Notify(nameof(Steam), new InvalidDataException($"Data.Length ({callback.Data.Length}) != BytesToWrite ({callback.BytesToWrite}) in OnMachineAuth"));
-            }
-
-            byte[] sentryHash;
-            int sentryFileSize;
-
-            await using (var stream = new MemoryStream(callback.BytesToWrite))
-            {
-                stream.Seek(callback.Offset, SeekOrigin.Begin);
-                stream.Write(callback.Data, 0, callback.BytesToWrite);
-                stream.Seek(0, SeekOrigin.Begin);
-                
-                using var sha = SHA1.Create();
-                sentryHash = await sha.ComputeHashAsync(stream);
-                sentryFileSize = (int)stream.Length;
-            }
-
-            Steam.Instance.User.SendMachineAuthResponse(new SteamUser.MachineAuthDetails
-            {
-                JobID = callback.JobID,
-
-                FileName = callback.FileName,
-
-                BytesWritten = callback.BytesToWrite,
-                FileSize = sentryFileSize,
-                Offset = callback.Offset,
-
-                Result = EResult.OK,
-                LastError = 0,
-
-                OneTimePassword = callback.OneTimePassword,
-
-                SentryFileHash = sentryHash,
-            });
-
-            await LocalConfig.Update("backend.sentryhash", Utils.ByteArrayToString(sentryHash));
-        }
-
         private static async void OnSessionToken(SteamUser.SessionTokenCallback callback)
         {
-            Log.WriteInfo(nameof(Steam), $"Got new login key with unique id {callback.SessionToken}");
+            Log.WriteInfo(nameof(Steam), $"Got new session token with unique id {callback.SessionToken}");
 
-            await LocalConfig.Update("backend.loginkey", callback.SessionToken.ToString());
+            await LocalConfig.Update("backend.sessiontoken", callback.SessionToken.ToString());
 
             // Steam.Instance.User.AcceptNewLoginKey(callback);
         }
