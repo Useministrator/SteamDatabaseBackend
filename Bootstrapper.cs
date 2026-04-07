@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using SteamKit2;
 
@@ -15,6 +16,8 @@ namespace SteamDatabaseBackend
     internal static class Bootstrapper
     {
         private static bool CleaningUp;
+        private static PosixSignalRegistration SignalInterruptRegistration;
+        private static PosixSignalRegistration SignalTerminateRegistration;
 
         public static async Task Main(string[] args)
         {
@@ -38,11 +41,19 @@ namespace SteamDatabaseBackend
             DebugLog.AddListener(new Log.SteamKitLogger());
             DebugLog.Enabled = true;
 
-            Console.CancelKeyPress += OnCancelKey;
-
             await Application.Init();
 
-            Steam.Instance.Tick();
+            RegisterSignalHandlers();
+
+            try
+            {
+                Steam.Instance.Tick();
+            }
+            finally
+            {
+                SignalTerminateRegistration?.Dispose();
+                SignalInterruptRegistration?.Dispose();
+            }
         }
 
         private static void HandleArguments(IEnumerable<string> args)
@@ -76,20 +87,37 @@ namespace SteamDatabaseBackend
             }
         }
 
-        private static void OnCancelKey(object sender, ConsoleCancelEventArgs e)
+        private static void RegisterSignalHandlers()
+        {
+            SignalInterruptRegistration = PosixSignalRegistration.Create(PosixSignal.SIGINT, HandlePosixSignal);
+
+            if (!OperatingSystem.IsWindows())
+            {
+                SignalTerminateRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, HandlePosixSignal);
+            }
+        }
+
+        private static void HandlePosixSignal(PosixSignalContext context)
+        {
+            context.Cancel = true;
+
+            RequestCleanup($"Received {context.Signal}");
+        }
+
+        private static void RequestCleanup(string reason)
         {
             if (CleaningUp)
             {
-                Log.WriteInfo(nameof(Bootstrapper), "Forcing exit");
+                Log.WriteInfo(nameof(Bootstrapper), $"Forcing exit after repeated shutdown signal ({reason})");
 
                 Environment.Exit(0);
 
                 return;
             }
 
-            e.Cancel = true;
-
             CleaningUp = true;
+
+            Log.WriteInfo(nameof(Bootstrapper), $"{reason}, shutting down");
 
             Application.Cleanup();
         }
