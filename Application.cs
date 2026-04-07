@@ -80,6 +80,12 @@ namespace SteamDatabaseBackend
         {
             Log.WriteInfo(nameof(Application), "Exiting...");
 
+            if (Settings.Current.BuiltInHttpServerPort > 0 && HttpServer != null)
+            {
+                HttpServer.Dispose();
+                HttpServer = null;
+            }
+
             try
             {
                 Steam.Instance.IsRunning = false;
@@ -89,11 +95,6 @@ namespace SteamDatabaseBackend
             catch (Exception e)
             {
                 ErrorReporter.Notify(nameof(Application), e);
-            }
-
-            if (Settings.Current.BuiltInHttpServerPort > 0)
-            {
-                HttpServer.Dispose();
             }
 
             if (Settings.Current.IRC.Enabled)

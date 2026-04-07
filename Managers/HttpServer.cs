@@ -22,6 +22,7 @@ namespace SteamDatabaseBackend
     {
         private Thread ServerThread;
         private HttpListener HttpListener;
+        private volatile bool Disposing;
 
         public HttpServer(uint port)
         {
@@ -37,36 +38,85 @@ namespace SteamDatabaseBackend
 
         public void Dispose()
         {
+            Disposing = true;
             ServerThread = null;
 
-            if (HttpListener != null)
+            var listener = Interlocked.Exchange(ref HttpListener, null);
+
+            if (listener != null)
             {
-                HttpListener.Close();
-                HttpListener = null;
+                try
+                {
+                    listener.Close();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (HttpListenerException)
+                {
+                }
             }
         }
 
         private async void ListenAsync()
         {
-            HttpListener.Start();
+            var listener = HttpListener;
 
-            foreach (var prefix in HttpListener.Prefixes)
+            if (listener == null)
             {
-                Log.WriteInfo(nameof(HttpServer), $"Started http listener: {prefix}");
+                return;
             }
 
-            while (Steam.Instance.IsRunning)
+            try
             {
-                try
+                listener.Start();
+
+                foreach (var prefix in listener.Prefixes)
                 {
-                    var context = await HttpListener.GetContextAsync();
-                    await ProcessAsync(context);
+                    Log.WriteInfo(nameof(HttpServer), $"Started http listener: {prefix}");
                 }
-                catch (Exception e)
+
+                while (Steam.Instance.IsRunning && !Disposing)
                 {
-                    Log.WriteDebug(nameof(HttpServer), e.Message);
+                    try
+                    {
+                        var context = await listener.GetContextAsync();
+                        await ProcessAsync(context);
+                    }
+                    catch (Exception e) when (IsExpectedShutdownException(e))
+                    {
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        Log.WriteDebug(nameof(HttpServer), e.Message);
+                    }
                 }
             }
+            catch (Exception e) when (IsExpectedShutdownException(e))
+            {
+            }
+        }
+
+        private bool IsExpectedShutdownException(Exception exception)
+        {
+            if (!Disposing && Steam.Instance.IsRunning)
+            {
+                return false;
+            }
+
+            if (exception is ObjectDisposedException || exception is HttpListenerException)
+            {
+                return true;
+            }
+
+            if (exception.Message.Contains("System.Net.HttpListener", StringComparison.Ordinal)
+                && exception.Message.Contains("disposed object", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return exception.InnerException != null && IsExpectedShutdownException(exception.InnerException);
         }
 
         private static async Task ProcessAsync(HttpListenerContext context)
