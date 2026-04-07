@@ -63,6 +63,11 @@ namespace SteamDatabaseBackend
 
         private static void WriteLine(Category category, string component, string str)
         {
+            if (!ShouldWrite(category))
+            {
+                return;
+            }
+
             var date = DateTime.Now;
             var logLine =  $"{date:HH:mm:ss} [{category}] {component}: {str}{Environment.NewLine}";
 
@@ -113,5 +118,16 @@ namespace SteamDatabaseBackend
                 }
             });
         }
+
+        private static bool ShouldWrite(Category category)
+            => category switch
+            {
+                Category.DEBUG => Settings.Current.LogLevel <= LogLevel.Debug,
+                Category.INFO => Settings.Current.LogLevel <= LogLevel.Info,
+                Category.WARN => Settings.Current.LogLevel <= LogLevel.Warn,
+                Category.ERROR => true,
+                Category.STEAMKIT => Settings.Current.SteamKitDebugLogEnabled,
+                _ => true,
+            };
     }
 }

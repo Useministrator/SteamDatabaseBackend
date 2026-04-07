@@ -6,6 +6,8 @@
 	"WebhookURL": "",
 	
 	"LogToFile": true,
+	"LogLevel": "Info",
+	"SteamKitDebugLogEnabled": false,
 	"OnlyOwnedDepots": true,
 	"BuiltInHttpServerPort": 0,
 	

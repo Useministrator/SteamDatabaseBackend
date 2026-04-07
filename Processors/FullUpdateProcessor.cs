@@ -229,7 +229,7 @@ namespace SteamDatabaseBackend
             var processes = PICSProductInfo.CurrentlyProcessingCount;
             var depots = Steam.Instance.DepotProcessor.DepotLocksCount;
 
-            Console.Error.WriteLine($"[{nameof(FullUpdateProcessor)}] Jobs: {jobs} - Tasks: {tasks} - Processing: {processes} - Depot locks: {depots}");
+            Log.WriteDebug(nameof(FullUpdateProcessor), $"Jobs: {jobs} - Tasks: {tasks} - Processing: {processes} - Depot locks: {depots}");
 
             // 2 tasks when not full running = PICS ticker and full update task
             return tasks > 3 || jobs > 0 || processes > 50 || depots > 4;

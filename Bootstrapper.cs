@@ -39,7 +39,7 @@ namespace SteamDatabaseBackend
             await Settings.Initialize();
 
             DebugLog.AddListener(new Log.SteamKitLogger());
-            DebugLog.Enabled = true;
+            DebugLog.Enabled = Settings.Current.SteamKitDebugLogEnabled;
 
             await Application.Init();
 

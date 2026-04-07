@@ -7,9 +7,18 @@
 using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
 
 namespace SteamDatabaseBackend
 {
+    internal enum LogLevel
+    {
+        Debug,
+        Info,
+        Warn,
+        Error,
+    }
+
     // Compiler complains that none of the fields are ever assigned
     // But it's only every used for de-serializing JSON, which makes sure that all the fields are present
 #pragma warning disable 0649
@@ -86,6 +95,13 @@ namespace SteamDatabaseBackend
 
         [JsonProperty(Required = Required.Always)]
         public bool LogToFile;
+
+        [JsonProperty(Required = Required.Default)]
+        [JsonConverter(typeof(StringEnumConverter))]
+        public LogLevel LogLevel = LogLevel.Info;
+
+        [JsonProperty(Required = Required.Default)]
+        public bool SteamKitDebugLogEnabled;
 
         [JsonProperty(Required = Required.Always)]
         public bool OnlyOwnedDepots;

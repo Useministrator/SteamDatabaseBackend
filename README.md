@@ -22,6 +22,8 @@ For Linux deployments, a recommended unit file is available at `contrib/systemd/
 
 Suggested operational defaults:
 * Set `LogToFile` to `false` and use `journalctl` for logs
+* Keep `LogLevel` at `Info` for regular service use, or raise it to `Warn` if you only want warnings and errors
+* Keep `SteamKitDebugLogEnabled` at `false` unless you are actively debugging Steam connectivity
 * Keep `settings.json` next to the published binary
 * Use `/run/steamdatabasebackend/steam-guard.env` for one-time Steam Guard codes during first login or token recovery
 

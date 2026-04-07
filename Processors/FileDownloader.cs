@@ -146,8 +146,7 @@ namespace SteamDatabaseBackend
 
                     if (fileState != EResult.SameAsPreviousValue)
                     {
-                        // Do not write progress info to log file
-                        Console.WriteLine($"{job.DepotName} [{downloadedFiles / (float) files.Count * 100.0f,6:#00.00}%] {files.Count - downloadedFiles} files left to download");
+                        Log.WriteDebug(nameof(FileDownloader), $"{job.DepotName} [{downloadedFiles / (float) files.Count * 100.0f,6:#00.00}%] {files.Count - downloadedFiles} files left to download");
                     }
 
                     if (downloadState == EResult.DataCorruption)
@@ -295,8 +294,7 @@ namespace SteamDatabaseBackend
                     {
                         downloadedSize += chunk.UncompressedLength;
 
-                        // Do not write progress info to log file
-                        Console.WriteLine($"{job.DepotName} [{downloadedSize / (float) file.TotalSize * 100.0f,6:#00.00}%] {file.FileName}");
+                        Log.WriteDebug(nameof(FileDownloader), $"{job.DepotName} [{downloadedSize / (float) file.TotalSize * 100.0f,6:#00.00}%] {file.FileName}");
                     }
                 });
             }
