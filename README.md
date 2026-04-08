@@ -17,6 +17,8 @@ If you plan on running this yourself, keep in mind that we won't provide support
 
 Use `anonymous` as the Steam username if you need to debug quickly.
 
+Detailed deployment steps for Ubuntu and Windows are in `docs/deployment-checklist.md`.
+
 ## systemd
 For Linux deployments, a recommended unit file is available at `contrib/systemd/steamdatabasebackend.service`.
 
