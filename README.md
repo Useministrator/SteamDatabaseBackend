@@ -43,5 +43,7 @@ STEAM_EMAIL_CODE=ABCDE
 STEAM_TWO_FACTOR_CODE=ABCDE
 ```
 
+The backend reads this file directly on startup or token recovery and deletes it after consuming a code. This makes the file suitable for one-time Steam Guard codes without reusing stale values on the next reconnect.
+
 ## License
 Use of SteamDB Updater is governed by a BSD-style license that can be found in the LICENSE file.

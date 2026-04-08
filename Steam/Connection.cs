@@ -6,6 +6,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Timers;
@@ -19,8 +20,11 @@ namespace SteamDatabaseBackend
     {
         private const int MAX_RETRY_DELAY = 300;
         private const int TOKEN_RETRY_DELAY = 30;
+        private const int GUARD_CODE_RETRY_DELAY = 60;
+        private const int MAX_GUARD_CODE_DELAY = 600;
         private const int RATE_LIMIT_RETRY_DELAY = 300;
         private const int MAX_RATE_LIMIT_DELAY = 1800;
+        private const string DefaultSteamGuardCodeFile = "/run/steamdatabasebackend/steam-guard.env";
 
         private static readonly HashSet<EResult> StoredTokenInvalidResults =
         [
@@ -39,6 +43,12 @@ namespace SteamDatabaseBackend
             EResult.WGNetworkSendExceeded,
         ];
 
+        private static readonly HashSet<EResult> GuardCodeResults =
+        [
+            EResult.AccountLogonDenied,
+            EResult.AccountLoginDeniedNeedTwoFactor,
+        ];
+
         private static readonly HashSet<EResult> ExpiredGuardDataResults =
         [
             EResult.Expired,
@@ -50,6 +60,19 @@ namespace SteamDatabaseBackend
 
         private sealed class EnvironmentAwareAuthenticator : IAuthenticator
         {
+            private enum GuardCodeKind
+            {
+                Email,
+                Device,
+            }
+
+            private sealed class GuardCodeState
+            {
+                public string Code { get; init; }
+                public bool IsNonInteractive { get; init; }
+                public string SourceDescription { get; init; }
+            }
+
             private static readonly string[] EmailCodeEnvironmentVariables =
             [
                 "STEAM_GUARD_CODE",
@@ -62,6 +85,10 @@ namespace SteamDatabaseBackend
                 "STEAM_TWO_FACTOR_CODE",
             ];
 
+            private static readonly object Sync = new();
+            private static readonly Dictionary<GuardCodeKind, GuardCodeState> LastIssuedCodes = new();
+            private static readonly HashSet<string> RejectedCodes = new(StringComparer.Ordinal);
+
             public Task<bool> AcceptDeviceConfirmationAsync() => Task.FromResult(false);
 
             public Task<string> GetDeviceCodeAsync(bool previousCodeWasIncorrect)
@@ -70,7 +97,7 @@ namespace SteamDatabaseBackend
                     ? "STEAM GUARD! The previous 2 factor auth code was incorrect. Please enter a new code from your authenticator app: "
                     : "STEAM GUARD! Please enter your 2 factor auth code from your authenticator app: ";
 
-                return Task.FromResult(ReadCode(DeviceCodeEnvironmentVariables, prompt));
+                return Task.FromResult(ReadCode(GuardCodeKind.Device, DeviceCodeEnvironmentVariables, prompt, previousCodeWasIncorrect));
             }
 
             public Task<string> GetEmailCodeAsync(string email, bool previousCodeWasIncorrect)
@@ -79,26 +106,205 @@ namespace SteamDatabaseBackend
                     ? $"STEAM GUARD! The previous email code was incorrect. Please enter the auth code sent to the email at {email}: "
                     : $"STEAM GUARD! Please enter the auth code sent to the email at {email}: ";
 
-                return Task.FromResult(ReadCode(EmailCodeEnvironmentVariables, prompt));
+                return Task.FromResult(ReadCode(GuardCodeKind.Email, EmailCodeEnvironmentVariables, prompt, previousCodeWasIncorrect));
             }
 
-            private static string ReadCode(string[] variableNames, string prompt)
+            public static string ReadEmailCode(string email, bool previousCodeWasIncorrect)
             {
-                foreach (var variableName in variableNames)
+                var prompt = previousCodeWasIncorrect
+                    ? $"STEAM GUARD! The previous email code was incorrect. Please enter the auth code sent to the email at {email}: "
+                    : $"STEAM GUARD! Please enter the auth code sent to the email at {email}: ";
+
+                return ReadCode(GuardCodeKind.Email, EmailCodeEnvironmentVariables, prompt, previousCodeWasIncorrect);
+            }
+
+            public static string ReadDeviceCode(bool previousCodeWasIncorrect)
+            {
+                var prompt = previousCodeWasIncorrect
+                    ? "STEAM GUARD! The previous 2 factor auth code was incorrect. Please enter a new code from your authenticator app: "
+                    : "STEAM GUARD! Please enter your 2 factor auth code from your authenticator app: ";
+
+                return ReadCode(GuardCodeKind.Device, DeviceCodeEnvironmentVariables, prompt, previousCodeWasIncorrect);
+            }
+
+            private static string ReadCode(GuardCodeKind kind, string[] variableNames, string prompt, bool previousCodeWasIncorrect)
+            {
+                lock (Sync)
                 {
-                    var value = Environment.GetEnvironmentVariable(variableName);
-
-                    if (!string.IsNullOrWhiteSpace(value))
+                    if (previousCodeWasIncorrect)
                     {
-                        Environment.SetEnvironmentVariable(variableName, null);
-
-                        return value.Trim();
+                        RejectLastIssuedCode(kind);
                     }
+
+                    var sourcedCode = TryReadCodeFromFile(variableNames);
+
+                    if (!string.IsNullOrWhiteSpace(sourcedCode))
+                    {
+                        LastIssuedCodes[kind] = new GuardCodeState
+                        {
+                            Code = sourcedCode,
+                            IsNonInteractive = true,
+                            SourceDescription = "steam guard code file",
+                        };
+
+                        return sourcedCode;
+                    }
+
+                    sourcedCode = TryReadCodeFromEnvironment(variableNames);
+
+                    if (!string.IsNullOrWhiteSpace(sourcedCode))
+                    {
+                        LastIssuedCodes[kind] = new GuardCodeState
+                        {
+                            Code = sourcedCode,
+                            IsNonInteractive = true,
+                            SourceDescription = "environment variable",
+                        };
+
+                        return sourcedCode;
+                    }
+                }
+
+                if (!IsInteractiveConsoleAvailable())
+                {
+                    Log.WriteWarn(nameof(Connection), "Steam Guard code is required, but no fresh code was found in the steam guard code file or environment variables");
+                    return null;
                 }
 
                 Console.Write(prompt);
 
-                return Console.ReadLine()?.Trim();
+                var consoleCode = Console.ReadLine()?.Trim();
+
+                if (string.IsNullOrWhiteSpace(consoleCode))
+                {
+                    return null;
+                }
+
+                lock (Sync)
+                {
+                    LastIssuedCodes[kind] = new GuardCodeState
+                    {
+                        Code = consoleCode,
+                        IsNonInteractive = false,
+                        SourceDescription = "interactive console input",
+                    };
+                }
+
+                return consoleCode;
+            }
+
+            private static void RejectLastIssuedCode(GuardCodeKind kind)
+            {
+                if (!LastIssuedCodes.TryGetValue(kind, out var state))
+                {
+                    return;
+                }
+
+                LastIssuedCodes.Remove(kind);
+
+                if (!state.IsNonInteractive || string.IsNullOrWhiteSpace(state.Code))
+                {
+                    return;
+                }
+
+                RejectedCodes.Add(state.Code);
+                Log.WriteWarn(nameof(Connection), $"Previously supplied Steam Guard code from {state.SourceDescription} was rejected; waiting for a fresh code");
+            }
+
+            private static string TryReadCodeFromEnvironment(IEnumerable<string> variableNames)
+            {
+                foreach (var variableName in variableNames)
+                {
+                    var value = Environment.GetEnvironmentVariable(variableName)?.Trim();
+
+                    if (string.IsNullOrWhiteSpace(value) || RejectedCodes.Contains(value))
+                    {
+                        continue;
+                    }
+
+                    Environment.SetEnvironmentVariable(variableName, null);
+
+                    return value;
+                }
+
+                return null;
+            }
+
+            private static string TryReadCodeFromFile(IEnumerable<string> variableNames)
+            {
+                var path = Environment.GetEnvironmentVariable("STEAM_GUARD_FILE");
+
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    path = Environment.GetEnvironmentVariable("STEAM_GUARD_CODE_FILE");
+                }
+
+                if (string.IsNullOrWhiteSpace(path) && !OperatingSystem.IsWindows())
+                {
+                    path = DefaultSteamGuardCodeFile;
+                }
+
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    var values = File
+                        .ReadAllLines(path)
+                        .Select(line => line.Trim())
+                        .Where(line => !string.IsNullOrWhiteSpace(line) && !line.StartsWith('#'))
+                        .Select(line => line.Split('=', 2))
+                        .Where(parts => parts.Length == 2)
+                        .ToDictionary(
+                            parts => parts[0].Trim(),
+                            parts => parts[1].Trim().Trim('"'),
+                            StringComparer.OrdinalIgnoreCase
+                        );
+
+                    foreach (var variableName in variableNames)
+                    {
+                        if (values.TryGetValue(variableName, out var value)
+                            && !string.IsNullOrWhiteSpace(value)
+                            && !RejectedCodes.Contains(value))
+                        {
+                            TryDeleteSteamGuardCodeFile(path);
+
+                            return value;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log.WriteWarn(nameof(Connection), $"Unable to read steam guard code file '{path}': {e.Message}");
+                }
+
+                return null;
+            }
+
+            private static void TryDeleteSteamGuardCodeFile(string path)
+            {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch (Exception e)
+                {
+                    Log.WriteWarn(nameof(Connection), $"Unable to delete steam guard code file '{path}' after reading it: {e.Message}");
+                }
+            }
+
+            private static bool IsInteractiveConsoleAvailable()
+            {
+                try
+                {
+                    return !Console.IsInputRedirected;
+                }
+                catch
+                {
+                    return false;
+                }
             }
         }
 
@@ -112,6 +318,8 @@ namespace SteamDatabaseBackend
         private bool IsTwoFactor;
         private bool CurrentAttemptUsedStoredToken;
         private bool CredentialRecoveryRequested;
+        private bool PreviousAttemptUsedEmailCode;
+        private bool PreviousAttemptUsedTwoFactorCode;
         private int ReconnectAttempts;
         private DateTime? NextReconnectAt;
 
@@ -217,6 +425,11 @@ namespace SteamDatabaseBackend
             {
                 baseDelay = RATE_LIMIT_RETRY_DELAY;
                 maxDelay = MAX_RATE_LIMIT_DELAY;
+            }
+            else if (result.HasValue && GuardCodeResults.Contains(result.Value))
+            {
+                baseDelay = GUARD_CODE_RETRY_DELAY;
+                maxDelay = MAX_GUARD_CODE_DELAY;
             }
             else if (result.HasValue && StoredTokenInvalidResults.Contains(result.Value))
             {
@@ -376,6 +589,9 @@ namespace SteamDatabaseBackend
                     LoginID = 0x78_50_61_77,
                 };
 
+                PreviousAttemptUsedEmailCode = !IsTwoFactor && !string.IsNullOrWhiteSpace(AuthCode);
+                PreviousAttemptUsedTwoFactorCode = IsTwoFactor && !string.IsNullOrWhiteSpace(AuthCode);
+
                 Steam.Instance.User.LogOn(logonDetails);
             }
             catch (Exception e)
@@ -409,20 +625,20 @@ namespace SteamDatabaseBackend
         {
             if (callback.Result == EResult.AccountLogonDenied)
             {
-                Console.Write($"STEAM GUARD! Please enter the auth code sent to the email at {callback.EmailDomain}: ");
-
                 IsTwoFactor = false;
-                AuthCode = Console.ReadLine()?.Trim();
+                AuthCode = EnvironmentAwareAuthenticator.ReadEmailCode(callback.EmailDomain, PreviousAttemptUsedEmailCode);
+                PreviousAttemptUsedEmailCode = false;
+                PreviousAttemptUsedTwoFactorCode = false;
                 ScheduleReconnectInternal("steam guard email code requested", callback.Result);
 
                 return;
             }
             else if (callback.Result == EResult.AccountLoginDeniedNeedTwoFactor)
             {
-                Console.Write("STEAM GUARD! Please enter your 2 factor auth code from your authenticator app: ");
-
                 IsTwoFactor = true;
-                AuthCode = Console.ReadLine()?.Trim();
+                AuthCode = EnvironmentAwareAuthenticator.ReadDeviceCode(PreviousAttemptUsedTwoFactorCode);
+                PreviousAttemptUsedEmailCode = false;
+                PreviousAttemptUsedTwoFactorCode = false;
                 ScheduleReconnectInternal("steam guard 2fa code requested", callback.Result);
 
                 return;
@@ -444,6 +660,8 @@ namespace SteamDatabaseBackend
             NextReconnectAt = null;
             CredentialRecoveryRequested = false;
             CurrentAttemptUsedStoredToken = false;
+            PreviousAttemptUsedEmailCode = false;
+            PreviousAttemptUsedTwoFactorCode = false;
             LastSuccessfulLogin = DateTime.Now;
             
             Log.WriteInfo(nameof(Steam), $"Logged in, current Valve time is {callback.ServerTime:R}");

@@ -10,7 +10,6 @@ Group=steamdb
 WorkingDirectory=/opt/steamdatabasebackend
 ExecStart=/opt/steamdatabasebackend/SteamDatabaseBackend -f=ImportantOnly
 EnvironmentFile=-/etc/default/steamdatabasebackend
-EnvironmentFile=-/run/steamdatabasebackend/steam-guard.env
 RuntimeDirectory=steamdatabasebackend
 RuntimeDirectoryMode=0750
 Restart=always
