@@ -121,6 +121,32 @@ sudo systemctl daemon-reload
 sudo systemctl enable steamdatabasebackend
 ```
 
+Notes:
+- the recommended unit starts the backend in normal daemon mode without `-f`
+- full-run modes such as `-f=ImportantOnly` are for manual one-off maintenance, not for the long-running service
+
+If the database is local to the same Ubuntu host, add a drop-in override for the actual database service in use.
+
+Example for MySQL:
+
+```bash
+sudo systemctl edit steamdatabasebackend
+```
+
+```ini
+[Unit]
+Wants=mysql.service
+After=mysql.service
+```
+
+Example for MariaDB:
+
+```ini
+[Unit]
+Wants=mariadb.service
+After=mariadb.service
+```
+
 ### 7. First start
 
 For the very first login, choose one of these paths:
@@ -217,7 +243,7 @@ Example:
 
 ```powershell
 Set-Location C:\SteamDatabaseBackend
-.\SteamDatabaseBackend.exe -f=ImportantOnly
+.\SteamDatabaseBackend.exe
 ```
 
 ### 6. Optional non-interactive Steam Guard
@@ -226,7 +252,7 @@ If you do not want to enter the code interactively, set a one-time environment v
 
 ```powershell
 $env:STEAM_GUARD_CODE = 'ABCDE'
-.\SteamDatabaseBackend.exe -f=ImportantOnly
+.\SteamDatabaseBackend.exe
 Remove-Item Env:\STEAM_GUARD_CODE
 ```
 
@@ -256,6 +282,7 @@ If you use a wrapper, keep these rules:
 - working directory must be the publish directory
 - `settings.json` must stay next to the executable
 - logs are easier to manage with `LogToFile = false` and external stdout/stderr capture
+- use normal daemon mode by default; reserve `-f=...` modes for manual one-off runs
 
 ## Post-Deployment Smoke Checklist
 

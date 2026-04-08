@@ -29,6 +29,10 @@ Suggested operational defaults:
 * Keep `settings.json` next to the published binary
 * Use `/run/steamdatabasebackend/steam-guard.env` for one-time Steam Guard codes during first login or token recovery
 
+The recommended unit starts the backend in normal daemon mode without `-f`.
+Use `-f=ImportantOnly`, `-f=Normal`, or other full-run modes only for manual one-off maintenance runs.
+If the database is local to the same Ubuntu host, add a host-specific `systemd` override for either `mysql.service` or `mariadb.service`.
+
 Example:
 ```bash
 sudo install -d -m 0755 /opt/steamdatabasebackend

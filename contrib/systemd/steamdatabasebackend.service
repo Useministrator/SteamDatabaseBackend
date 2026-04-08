@@ -8,7 +8,7 @@ Type=simple
 User=steamdb
 Group=steamdb
 WorkingDirectory=/opt/steamdatabasebackend
-ExecStart=/opt/steamdatabasebackend/SteamDatabaseBackend -f=ImportantOnly
+ExecStart=/opt/steamdatabasebackend/SteamDatabaseBackend
 EnvironmentFile=-/etc/default/steamdatabasebackend
 RuntimeDirectory=steamdatabasebackend
 RuntimeDirectoryMode=0750
