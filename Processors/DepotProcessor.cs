@@ -34,6 +34,7 @@ namespace SteamDatabaseBackend
             public uint DepotId;
             public int BuildId;
             public string BranchName = "public";
+            public bool IsPreferredBranch;
             public ulong ManifestId;
             public ulong LastManifestId;
             public string DepotName;
@@ -44,7 +45,7 @@ namespace SteamDatabaseBackend
             public bool DownloadCorrupted;
         }
 
-        public const string HistoryQuery = "INSERT INTO `DepotsHistory` (`ManifestID`, `ChangeID`, `DepotID`, `File`, `Action`, `OldValue`, `NewValue`) VALUES (@ManifestID, @ChangeID, @DepotID, @File, @Action, @OldValue, @NewValue)";
+        public const string HistoryQuery = "INSERT INTO `DepotsHistory` (`ManifestID`, `ChangeID`, `DepotID`, `BranchName`, `File`, `Action`, `OldValue`, `NewValue`) VALUES (@ManifestID, @ChangeID, @DepotID, @BranchName, @File, @Action, @OldValue, @NewValue)";
 
         private static readonly object UpdateScriptLock = new object();
         private static readonly TimeSpan CdnAuthTokenRefreshWindow = TimeSpan.FromMinutes(1);
@@ -55,7 +56,7 @@ namespace SteamDatabaseBackend
             public DateTime Expiration { get; init; }
         }
 
-        private readonly Dictionary<uint, byte> DepotLocks = new Dictionary<uint, byte>();
+        private readonly Dictionary<string, byte> DepotLocks = new Dictionary<string, byte>();
         private readonly ConcurrentDictionary<(uint AppId, uint DepotId, string Host), CachedCdnAuthToken> CdnAuthTokens = new();
         private readonly ConcurrentDictionary<(uint AppId, uint DepotId, string Host), SemaphoreSlim> CdnAuthTokenLocks = new();
         private SemaphoreSlim ManifestDownloadSemaphore = new SemaphoreSlim(15);
@@ -65,7 +66,7 @@ namespace SteamDatabaseBackend
         private List<Server> CDNServers;
 
         public int DepotLocksCount => DepotLocks.Count;
-        public Dictionary<uint, byte>.KeyCollection DepotLocksKeys => DepotLocks.Keys;
+        public Dictionary<string, byte>.KeyCollection DepotLocksKeys => DepotLocks.Keys;
         public DateTime LastServerRefreshTime { get; private set; } = DateTime.Now;
 
         private Regex DepotNameStart;
@@ -184,6 +185,11 @@ namespace SteamDatabaseBackend
                 : $"{appName} Depot {depotId} ({string.Join(", ", hints.Distinct(StringComparer.OrdinalIgnoreCase))})";
         }
 
+        private static string GetDepotLockKey(uint depotId, string branchName)
+        {
+            return $"{depotId}:{branchName}";
+        }
+
         public void Dispose()
         {
             if (CDNClient != null)
@@ -264,14 +270,8 @@ namespace SteamDatabaseBackend
             // Get data in format we want first
             foreach (var depot in depots.Children)
             {
-                var request = new ManifestJob
-                {
-                    AppId = appID,
-                    ChangeNumber = changeNumber,
-                };
-
                 // Ignore keys that aren't integers, for example "branches"
-                if (!uint.TryParse(depot.Name, out request.DepotId))
+                if (!uint.TryParse(depot.Name, out var depotId))
                 {
                     continue;
                 }
@@ -283,7 +283,7 @@ namespace SteamDatabaseBackend
                 }
 
                 var explicitDepotName = depot["name"].AsString();
-                request.DepotName = GetDepotName(depot, appID, request.DepotId, explicitDepotName);
+                var depotName = GetDepotName(depot, appID, depotId, explicitDepotName);
 
                 if (!string.IsNullOrEmpty(explicitDepotName) && depot["dlcappid"].Value != null)
                 {
@@ -293,45 +293,52 @@ namespace SteamDatabaseBackend
                     }
                 }
 
-                // TODO: instead of locking we could wait for current process to finish
-                if (DepotLocks.ContainsKey(request.DepotId))
+                var validManifestBranches = depot["manifests"].Children
+                    .Where(branch => branch.Name != "local" && TryGetManifestId(branch, out _))
+                    .ToList();
+
+                if (validManifestBranches.Count == 0)
                 {
+                    await db.ExecuteAsync(
+                        "INSERT INTO `Depots` (`DepotID`, `Name`) VALUES (@DepotID, @DepotName) ON DUPLICATE KEY UPDATE `Name` = VALUES(`Name`)",
+                        new
+                        {
+                            DepotID = depotId,
+                            DepotName = depotName,
+                        });
+
                     continue;
                 }
 
-                // SteamVR trickery
-                if (appID == 250820
-                    && TryGetManifestId(depot["manifests"]["beta"], out _)
-                    && depots["branches"]["beta"]["buildid"].AsInteger() > depots["branches"]["public"]["buildid"].AsInteger())
-                {
-                    request.BranchName = "beta";
-                    request.BuildId = depots["branches"]["beta"]["buildid"].AsInteger();
-                    request.ManifestId = ParseManifestId(depot["manifests"]["beta"]);
-                }
-                else
-                if (!TryGetManifestId(depot["manifests"]["public"], out request.ManifestId))
-                {
-                    var branch = depot["manifests"].Children.Find(x => x.Name != "local" && TryGetManifestId(x, out _));
+                var preferredBranchName = validManifestBranches
+                    .FirstOrDefault(branch => branch.Name.Equals("public", StringComparison.OrdinalIgnoreCase))
+                    ?.Name ?? validManifestBranches[0].Name;
 
-                    if (branch == null || !TryGetManifestId(branch, out request.ManifestId))
+                foreach (var manifestBranch in validManifestBranches)
+                {
+                    var branchName = string.IsNullOrEmpty(manifestBranch.Name) ? "public" : manifestBranch.Name;
+                    var lockKey = GetDepotLockKey(depotId, branchName);
+
+                    lock (DepotLocks)
                     {
-                        await db.ExecuteAsync("INSERT INTO `Depots` (`DepotID`, `Name`) VALUES (@DepotID, @DepotName) ON DUPLICATE KEY UPDATE `DepotID` = VALUES(`DepotID`)", new { DepotID = request.DepotId, request.DepotName });
-
-                        continue;
+                        if (DepotLocks.ContainsKey(lockKey))
+                        {
+                            continue;
+                        }
                     }
 
-                    Log.WriteDebug(nameof(DepotProcessor), $"Depot {request.DepotId} (from {appID}) has no public branch, but there is another one");
-
-                    request.BranchName = branch.Name;
-                    request.BuildId = depots["branches"][branch.Name]["buildid"].AsInteger();
+                    requests.Add(new ManifestJob
+                    {
+                        AppId = appID,
+                        ChangeNumber = changeNumber,
+                        DepotId = depotId,
+                        BuildId = depots["branches"][branchName]["buildid"].AsInteger(),
+                        BranchName = branchName,
+                        IsPreferredBranch = branchName.Equals(preferredBranchName, StringComparison.OrdinalIgnoreCase),
+                        ManifestId = ParseManifestId(manifestBranch),
+                        DepotName = depotName,
+                    });
                 }
-                else
-                {
-                    request.BranchName = "public";
-                    request.BuildId = depots["branches"]["public"]["buildid"].AsInteger();
-                }
-
-                requests.Add(request);
             }
 
             if (dlcNames.Any())
@@ -371,69 +378,82 @@ namespace SteamDatabaseBackend
             var depotsToDownload = new List<ManifestJob>();
 
             var depotIds = requests.Select(x => x.DepotId).ToList();
-            var dbDepots = (await db.QueryAsync<Depot>("SELECT `DepotID`, `Name`, `BuildID`, `ManifestID`, `LastManifestID`, `FilenamesEncrypted` FROM `Depots` WHERE `DepotID` IN @depotIds", new { depotIds }))
+            var dbDepots = (await db.QueryAsync<Depot>("SELECT `DepotID`, `Name`, `PreferredBranchName`, `BuildID`, `ManifestID`, `LastManifestID`, `FilenamesEncrypted` FROM `Depots` WHERE `DepotID` IN @depotIds", new { depotIds }))
                 .ToDictionary(x => x.DepotID, x => x);
+            var dbDepotBranches = (await db.QueryAsync<DepotBranch>("SELECT `DepotID`, `BranchName`, `BuildID`, `ManifestID`, `LastManifestID`, `FilenamesEncrypted` FROM `DepotBranches` WHERE `DepotID` IN @depotIds", new { depotIds }))
+                .ToDictionary(x => (x.DepotID, x.BranchName), x => x);
 
             var decryptionKeys = (await db.QueryAsync<DepotKey>("SELECT `DepotID`, `Key` FROM `DepotsKeys` WHERE `DepotID` IN @depotIds", new { depotIds }))
                 .ToDictionary(x => x.DepotID, x => Utils.StringToByteArray(x.Key));
 
             foreach (var request in requests)
             {
-                Depot dbDepot;
+                dbDepots.TryGetValue(request.DepotId, out var dbDepot);
+                dbDepot ??= new Depot();
+
+                dbDepotBranches.TryGetValue((request.DepotId, request.BranchName), out var dbDepotBranch);
+                dbDepotBranch ??= new DepotBranch
+                {
+                    DepotID = request.DepotId,
+                    BranchName = request.BranchName,
+                };
 
                 decryptionKeys.TryGetValue(request.DepotId, out request.DepotKey);
 
-                if (dbDepots.ContainsKey(request.DepotId))
+                if (dbDepotBranch.BuildID > request.BuildId)
                 {
-                    dbDepot = dbDepots[request.DepotId];
+                    Log.WriteDebug(nameof(DepotProcessor), $"Skipping depot {request.DepotId} branch {request.BranchName} due to old buildid: {dbDepotBranch.BuildID} > {request.BuildId}");
 
-                    if (dbDepot.BuildID > request.BuildId)
-                    {
-                        // buildid went back in time? this either means a rollback, or a shared depot that isn't synced properly
+                    continue;
+                }
 
-                        Log.WriteDebug(nameof(DepotProcessor), $"Skipping depot {request.DepotId} due to old buildid: {dbDepot.BuildID} > {request.BuildId}");
+                request.StoredFilenamesEncrypted = dbDepotBranch.FilenamesEncrypted;
+                request.LastManifestId = dbDepotBranch.LastManifestID;
 
-                        continue;
-                    }
-
-                    if (dbDepot.LastManifestID == request.ManifestId
-                    && dbDepot.ManifestID == request.ManifestId
-                    && Settings.FullRun != FullRunState.WithForcedDepots
-                    && !dbDepot.FilenamesEncrypted && request.DepotKey != null)
-                    {
-                        // Update depot name if changed
-                        if (request.DepotName != dbDepot.Name)
+                if (request.IsPreferredBranch && (dbDepot.BuildID != request.BuildId
+                    || dbDepot.ManifestID != request.ManifestId
+                    || request.DepotName != dbDepot.Name
+                    || !string.Equals(dbDepot.PreferredBranchName, request.BranchName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    await db.ExecuteAsync(
+                        @"INSERT INTO `Depots` (`DepotID`, `Name`, `PreferredBranchName`, `BuildID`, `ManifestID`) VALUES (@DepotID, @DepotName, @PreferredBranchName, @BuildID, @ManifestID)
+                          ON DUPLICATE KEY UPDATE `LastUpdated` = CURRENT_TIMESTAMP(), `Name` = VALUES(`Name`), `PreferredBranchName` = VALUES(`PreferredBranchName`), `BuildID` = VALUES(`BuildID`), `ManifestID` = VALUES(`ManifestID`)",
+                        new
                         {
-                            await db.ExecuteAsync("UPDATE `Depots` SET `Name` = @DepotName WHERE `DepotID` = @DepotID", new { DepotID = request.DepotId, request.DepotName });
-                        }
-
-                        continue;
-                    }
-
-                    request.StoredFilenamesEncrypted = dbDepot.FilenamesEncrypted;
-                    request.LastManifestId = dbDepot.LastManifestID;
-                }
-                else
-                {
-                    dbDepot = new Depot();
+                            DepotID = request.DepotId,
+                            DepotName = request.DepotName,
+                            PreferredBranchName = request.BranchName,
+                            BuildID = request.BuildId,
+                            ManifestID = request.ManifestId,
+                        });
                 }
 
-                if (dbDepot.BuildID != request.BuildId || dbDepot.ManifestID != request.ManifestId || request.DepotName != dbDepot.Name)
+                if (dbDepotBranch.BuildID != request.BuildId || dbDepotBranch.ManifestID != request.ManifestId)
                 {
-                    await db.ExecuteAsync(@"INSERT INTO `Depots` (`DepotID`, `Name`, `BuildID`, `ManifestID`) VALUES (@DepotID, @DepotName, @BuildID, @ManifestID)
-                                ON DUPLICATE KEY UPDATE `LastUpdated` = CURRENT_TIMESTAMP(), `Name` = VALUES(`Name`), `BuildID` = VALUES(`BuildID`), `ManifestID` = VALUES(`ManifestID`)",
-                    new
-                    {
-                        DepotID = request.DepotId,
-                        request.DepotName,
-                        BuildID = request.BuildId,
-                        ManifestID = request.ManifestId
-                    });
+                    await db.ExecuteAsync(
+                        @"INSERT INTO `DepotBranches` (`DepotID`, `BranchName`, `BuildID`, `ManifestID`) VALUES (@DepotID, @BranchName, @BuildID, @ManifestID)
+                          ON DUPLICATE KEY UPDATE `LastUpdated` = CURRENT_TIMESTAMP(), `BuildID` = VALUES(`BuildID`), `ManifestID` = VALUES(`ManifestID`)",
+                        new
+                        {
+                            DepotID = request.DepotId,
+                            request.BranchName,
+                            BuildID = request.BuildId,
+                            ManifestID = request.ManifestId,
+                        });
                 }
 
-                if (dbDepot.ManifestID != request.ManifestId)
+                if (dbDepotBranch.ManifestID != request.ManifestId)
                 {
-                    await MakeHistory(db, null, request, string.Empty, "manifest_change", dbDepot.ManifestID, request.ManifestId);
+                    await MakeHistory(db, null, request, string.Empty, "manifest_change", dbDepotBranch.ManifestID, request.ManifestId);
+                }
+
+                if (dbDepotBranch.LastManifestID == request.ManifestId
+                    && dbDepotBranch.ManifestID == request.ManifestId
+                    && Settings.FullRun != FullRunState.WithForcedDepots
+                    && !dbDepotBranch.FilenamesEncrypted
+                    && request.DepotKey != null)
+                {
+                    continue;
                 }
 
                 if (Settings.Current.OnlyOwnedDepots && !LicenseList.OwnedDepots.ContainsKey(request.DepotId))
@@ -443,7 +463,7 @@ namespace SteamDatabaseBackend
 
                 lock (DepotLocks)
                 {
-                    DepotLocks.Add(request.DepotId, 1);
+                    DepotLocks.Add(GetDepotLockKey(request.DepotId, request.BranchName), 1);
                 }
 
                 depotsToDownload.Add(request);
@@ -457,7 +477,7 @@ namespace SteamDatabaseBackend
 
                     foreach (var depot in depotsToDownload)
                     {
-                        RemoveLock(depot.DepotId);
+                        RemoveLock(depot.DepotId, depot.BranchName);
                     }
                 }, TaskContinuationOptions.OnlyOnFaulted);
             }
@@ -623,7 +643,7 @@ namespace SteamDatabaseBackend
         {
             Log.WriteDebug(nameof(DepotProcessor), $"Will process {depots.Count} depots from app {appID} ({DepotLocks.Count} depot locks left)");
 
-            var processTasks = new List<Task<(uint DepotID, EResult Result)>>();
+            var processTasks = new List<Task<(uint DepotID, string BranchName, EResult Result)>>();
             var anyFilesDownloaded = false;
             var willDownloadFiles = false;
 
@@ -633,7 +653,7 @@ namespace SteamDatabaseBackend
                     && depot.LastManifestId == depot.ManifestId
                     && Settings.FullRun != FullRunState.WithForcedDepots)
                 {
-                    RemoveLock(depot.DepotId);
+                    RemoveLock(depot.DepotId, depot.BranchName);
 
                     continue;
                 }
@@ -646,7 +666,7 @@ namespace SteamDatabaseBackend
                 var manifestRequestCode = await GetDepotManifestRequestCodeAsync(depot.DepotId, appID, depot.ManifestId, depot.BranchName);
                 if (manifestRequestCode == 0)
                 {
-                    RemoveLock(depot.DepotId);
+                    RemoveLock(depot.DepotId, depot.BranchName);
 
                     continue;
                 }
@@ -698,11 +718,11 @@ namespace SteamDatabaseBackend
 
                 if (depotManifest == null)
                 {
-                    RemoveLock(depot.DepotId);
+                    RemoveLock(depot.DepotId, depot.BranchName);
 
                     if (FileDownloader.IsImportantDepot(depot.DepotId))
                     {
-                        IRC.Instance.SendOps($"{Colors.OLIVE}[{depot.DepotName}]{Colors.NORMAL} Failed to download manifest ({lastError})");
+                        IRC.Instance.SendOps($"{Colors.OLIVE}[{depot.DepotName} / {depot.BranchName}]{Colors.NORMAL} Failed to download manifest ({lastError})");
                     }
 
                     if (!Settings.IsFullRun && depot.DepotKey != null)
@@ -722,7 +742,9 @@ namespace SteamDatabaseBackend
 
                 processTasks.Add(task);
 
-                if (!FileDownloader.IsImportantDepot(depot.DepotId) || depot.DepotKey == null)
+                if (!FileDownloader.IsImportantDepot(depot.DepotId)
+                    || depot.DepotKey == null
+                    || !depot.BranchName.Equals("public", StringComparison.OrdinalIgnoreCase))
                 {
                     depot.Result = EResult.Ignored;
                     continue;
@@ -748,7 +770,7 @@ namespace SteamDatabaseBackend
                         ErrorReporter.Notify($"Depot Processor {depot.DepotId}", e);
                     }
 
-                    return (DepotID: depot.DepotId, result);
+                    return (DepotID: depot.DepotId, BranchName: depot.BranchName, result);
                 });
 
                 processTasks.Add(task);
@@ -760,7 +782,7 @@ namespace SteamDatabaseBackend
                 {
                     _ = task.ContinueWith(result =>
                     {
-                        RemoveLock(result.Result.DepotID);
+                        RemoveLock(result.Result.DepotID, result.Result.BranchName);
                     }, TaskManager.TaskCancellationToken.Token);
                 }
 
@@ -789,10 +811,15 @@ namespace SteamDatabaseBackend
 
                         // Mark this depot for redownload
                         using var db = Database.Get();
-                        db.Execute("UPDATE `Depots` SET `LastManifestID` = 0 WHERE `DepotID` = @DepotID", new { DepotID = depot.DepotId });
+                        db.Execute("UPDATE `DepotBranches` SET `LastManifestID` = 0 WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName", new { DepotID = depot.DepotId, depot.BranchName });
+
+                        if (depot.IsPreferredBranch)
+                        {
+                            db.Execute("UPDATE `Depots` SET `LastManifestID` = 0 WHERE `DepotID` = @DepotID", new { DepotID = depot.DepotId });
+                        }
                     }
 
-                    RemoveLock(depot.DepotId);
+                    RemoveLock(depot.DepotId, depot.BranchName);
                 }
 
                 // Only commit changes if all depots downloaded
@@ -851,7 +878,7 @@ namespace SteamDatabaseBackend
             return RunUpdateScript(updateScript, buildID.ToString());
         }
 
-        private static async Task<(uint, EResult)> ProcessDepotAfterDownload(ManifestJob request, DepotManifest depotManifest)
+        private static async Task<(uint, string, EResult)> ProcessDepotAfterDownload(ManifestJob request, DepotManifest depotManifest)
         {
             await using var db = await Database.GetConnectionAsync();
             await using var transaction = await db.BeginTransactionAsync();
@@ -859,12 +886,15 @@ namespace SteamDatabaseBackend
             var result = await ProcessDepotAfterDownload(db, transaction, request, depotManifest);
             await transaction.CommitAsync();
 
-            return (request.DepotId, result);
+            return (request.DepotId, request.BranchName, result);
         }
 
         private static async Task<EResult> ProcessDepotAfterDownload(IDbConnection db, IDbTransaction transaction, ManifestJob request, DepotManifest depotManifest)
         {
-            var filesOld = (await db.QueryAsync<DepotFile>("SELECT `File`, `Hash`, `Size`, `Flags` FROM `DepotsFiles` WHERE `DepotID` = @DepotID", new { DepotID = request.DepotId }, transaction)).ToDictionary(x => x.File, x => x);
+            var filesOld = (await db.QueryAsync<DepotFile>(
+                "SELECT `BranchName`, `File`, `Hash`, `Size`, `Flags` FROM `DepotsFiles` WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName",
+                new { DepotID = request.DepotId, request.BranchName },
+                transaction)).ToDictionary(x => x.File, x => x);
             var filesAdded = new List<DepotFile>();
             var currentManifestFilenamesEncrypted = depotManifest.FilenamesEncrypted;
 
@@ -897,9 +927,10 @@ namespace SteamDatabaseBackend
 
                     decryptedFilesOld.Add(file.File, file);
 
-                    await db.ExecuteAsync("UPDATE `DepotsFiles` SET `File` = @File WHERE `DepotID` = @DepotID AND `File` = @OldFile", new
+                    await db.ExecuteAsync("UPDATE `DepotsFiles` SET `File` = @File WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName AND `File` = @OldFile", new
                     {
                         DepotID = request.DepotId,
+                        request.BranchName,
                         file.File,
                         OldFile = oldFile
                     }, transaction);
@@ -929,7 +960,7 @@ namespace SteamDatabaseBackend
                 // game with a big node_modules path, so we're safeguarding by limiting it.
                 if (name.Length > 260)
                 {
-                    if (depotManifest.FilenamesEncrypted)
+                    if (currentManifestFilenamesEncrypted)
                     {
                         continue;
                     }
@@ -960,9 +991,10 @@ namespace SteamDatabaseBackend
 
                     if (updateFile)
                     {
-                        await db.ExecuteAsync("UPDATE `DepotsFiles` SET `Hash` = @Hash, `Size` = @Size, `Flags` = @Flags WHERE `DepotID` = @DepotID AND `File` = @File", new DepotFile
+                        await db.ExecuteAsync("UPDATE `DepotsFiles` SET `Hash` = @Hash, `Size` = @Size, `Flags` = @Flags WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName AND `File` = @File", new DepotFile
                         {
                             DepotID = request.DepotId,
+                            BranchName = request.BranchName,
                             File = name,
                             Hash = hash,
                             Size = file.TotalSize,
@@ -978,6 +1010,7 @@ namespace SteamDatabaseBackend
                     filesAdded.Add(new DepotFile
                     {
                         DepotID = request.DepotId,
+                        BranchName = request.BranchName,
                         Hash = hash,
                         File = name,
                         Size = file.TotalSize,
@@ -993,10 +1026,11 @@ namespace SteamDatabaseBackend
 
                 foreach (var filesOldChunk in filesOldChunks)
                 {
-                    await db.ExecuteAsync("DELETE FROM `DepotsFiles` WHERE `DepotID` = @DepotID AND `File` IN @Files",
+                    await db.ExecuteAsync("DELETE FROM `DepotsFiles` WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName AND `File` IN @Files",
                         new
                         {
                             DepotID = request.DepotId,
+                            request.BranchName,
                             Files = filesOldChunk,
                         }, transaction);
                 }
@@ -1006,6 +1040,7 @@ namespace SteamDatabaseBackend
                     await db.ExecuteAsync(HistoryQuery, filesOld.Select(x => new DepotHistory
                     {
                         DepotID = request.DepotId,
+                        BranchName = request.BranchName,
                         ManifestID = request.ManifestId,
                         ChangeID = request.ChangeNumber,
                         Action = "removed",
@@ -1017,13 +1052,14 @@ namespace SteamDatabaseBackend
 
             if (filesAdded.Count > 0)
             {
-                await db.ExecuteAsync("INSERT INTO `DepotsFiles` (`DepotID`, `File`, `Hash`, `Size`, `Flags`) VALUES (@DepotID, @File, @Hash, @Size, @Flags)", filesAdded, transaction);
+                await db.ExecuteAsync("INSERT INTO `DepotsFiles` (`DepotID`, `BranchName`, `File`, `Hash`, `Size`, `Flags`) VALUES (@DepotID, @BranchName, @File, @Hash, @Size, @Flags)", filesAdded, transaction);
 
                 if (shouldHistorize)
                 {
                     await db.ExecuteAsync(HistoryQuery, filesAdded.Select(x => new DepotHistory
                     {
                         DepotID = request.DepotId,
+                        BranchName = request.BranchName,
                         ManifestID = request.ManifestId,
                         ChangeID = request.ChangeNumber,
                         Action = "added",
@@ -1035,17 +1071,37 @@ namespace SteamDatabaseBackend
 
             await db.ExecuteAsync(
                 request.LastManifestId == request.ManifestId ?
-                    "UPDATE `Depots` SET `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed WHERE `DepotID` = @DepotID" :
-                    "UPDATE `Depots` SET `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed, `LastUpdated` = CURRENT_TIMESTAMP() WHERE `DepotID` = @DepotID",
+                    "UPDATE `DepotBranches` SET `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName" :
+                    "UPDATE `DepotBranches` SET `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed, `LastUpdated` = CURRENT_TIMESTAMP() WHERE `DepotID` = @DepotID AND `BranchName` = @BranchName",
                 new
                 {
                     DepotID = request.DepotId,
+                    request.BranchName,
                     ManifestID = request.ManifestId,
                     FilenamesEncrypted = currentManifestFilenamesEncrypted,
                     ManifestDate = depotManifest.CreationTime,
                     SizeOriginal = depotManifest.TotalUncompressedSize,
                     SizeCompressed = depotManifest.TotalCompressedSize,
                 }, transaction);
+
+            if (request.IsPreferredBranch)
+            {
+                await db.ExecuteAsync(
+                    request.LastManifestId == request.ManifestId ?
+                        "UPDATE `Depots` SET `PreferredBranchName` = @BranchName, `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed WHERE `DepotID` = @DepotID" :
+                        "UPDATE `Depots` SET `PreferredBranchName` = @BranchName, `LastManifestID` = @ManifestID, `ManifestDate` = @ManifestDate, `FilenamesEncrypted` = @FilenamesEncrypted, `SizeOriginal` = @SizeOriginal, `SizeCompressed` = @SizeCompressed, `LastUpdated` = CURRENT_TIMESTAMP() WHERE `DepotID` = @DepotID",
+                    new
+                    {
+                        DepotID = request.DepotId,
+                        request.BranchName,
+                        ManifestID = request.ManifestId,
+                        FilenamesEncrypted = currentManifestFilenamesEncrypted,
+                        ManifestDate = depotManifest.CreationTime,
+                        SizeOriginal = depotManifest.TotalUncompressedSize,
+                        SizeCompressed = depotManifest.TotalCompressedSize,
+                    },
+                    transaction);
+            }
 
             return EResult.OK;
         }
@@ -1165,6 +1221,7 @@ namespace SteamDatabaseBackend
                 new DepotHistory
                 {
                     DepotID = request.DepotId,
+                    BranchName = request.BranchName,
                     ManifestID = request.ManifestId,
                     ChangeID = request.ChangeNumber,
                     Action = action,
@@ -1176,13 +1233,15 @@ namespace SteamDatabaseBackend
             );
         }
 
-        private void RemoveLock(uint depotID)
+        private void RemoveLock(uint depotID, string branchName)
         {
+            var lockKey = GetDepotLockKey(depotID, branchName);
+
             lock (DepotLocks)
             {
-                if (DepotLocks.Remove(depotID))
+                if (DepotLocks.Remove(lockKey))
                 {
-                    Log.WriteInfo(nameof(DepotProcessor), $"Processed depot {depotID} ({DepotLocks.Count} depot locks left)");
+                    Log.WriteInfo(nameof(DepotProcessor), $"Processed depot {depotID} ({branchName}, {DepotLocks.Count} depot locks left)");
                 }
             }
         }

@@ -6,6 +6,8 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -57,7 +59,44 @@ namespace SteamDatabaseBackend
         {
             Log.WriteInfo(nameof(TaskManager), $"Cancelling {TasksCount} tasks...");
 
-            TaskCancellationToken.Cancel();
+            if (!TaskCancellationToken.IsCancellationRequested)
+            {
+                TaskCancellationToken.Cancel();
+            }
+        }
+
+        public static void WaitForDrain(TimeSpan timeout, TimeSpan? pollInterval = null)
+        {
+            var interval = pollInterval ?? TimeSpan.FromMilliseconds(250);
+            var stopwatch = Stopwatch.StartNew();
+
+            while (stopwatch.Elapsed < timeout)
+            {
+                var pendingTasks = Tasks.Keys.Where(task => !task.IsCompleted).ToArray();
+
+                if (pendingTasks.Length == 0)
+                {
+                    Log.WriteInfo(nameof(TaskManager), $"All tasks drained in {stopwatch.Elapsed.TotalSeconds:0.0}s");
+
+                    return;
+                }
+
+                try
+                {
+                    Task.WaitAny(pendingTasks, interval);
+                }
+                catch (AggregateException)
+                {
+                    // Individual task failures are already routed through ErrorReporter.
+                }
+            }
+
+            var remainingTasks = Tasks.Keys.Count(task => !task.IsCompleted);
+
+            if (remainingTasks > 0)
+            {
+                Log.WriteWarn(nameof(TaskManager), $"Timed out waiting for {remainingTasks} task(s) to drain after {timeout.TotalSeconds:0}s");
+            }
         }
     }
 }

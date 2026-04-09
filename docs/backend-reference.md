@@ -432,6 +432,7 @@ Current implementation returns:
 - `TasksCount`
 - `CurrentlyProcessingKeys`
 - `DepotLocksKeys`
+  These are currently emitted as `DepotID:BranchName`.
 
 ## 10. IRC and Steam Chat Commands
 
@@ -506,9 +507,10 @@ This file is the required starting point for a fresh installation.
 
 | Table | Purpose | Key columns |
 | --- | --- | --- |
-| `Depots` | Current depot summary state. | `DepotID`, `Name`, `BuildID`, `ManifestID`, `LastManifestID`, `ManifestDate`, `FilenamesEncrypted`, `SizeOriginal`, `SizeCompressed`, `LastUpdated` |
-| `DepotsFiles` | Current file tree snapshot for a depot manifest. | `DepotID`, `File`, `Hash`, `Size`, `Flags` |
-| `DepotsHistory` | File and manifest delta history. | `ID`, `ChangeID`, `ManifestID`, `DepotID`, `Action`, `File`, `OldValue`, `NewValue` |
+| `Depots` | Preferred-branch depot summary state used by compatibility paths and simple lookups. | `DepotID`, `Name`, `PreferredBranchName`, `BuildID`, `ManifestID`, `LastManifestID`, `ManifestDate`, `FilenamesEncrypted`, `SizeOriginal`, `SizeCompressed`, `LastUpdated` |
+| `DepotBranches` | Canonical current state per depot branch. | `DepotID`, `BranchName`, `BuildID`, `ManifestID`, `LastManifestID`, `ManifestDate`, `FilenamesEncrypted`, `SizeOriginal`, `SizeCompressed`, `LastUpdated` |
+| `DepotsFiles` | Current file tree snapshot for a depot manifest branch. | `DepotID`, `BranchName`, `File`, `Hash`, `Size`, `Flags` |
+| `DepotsHistory` | File and manifest delta history, branch-aware for manifest and file actions. | `ID`, `ChangeID`, `ManifestID`, `DepotID`, `BranchName`, `Action`, `File`, `OldValue`, `NewValue` |
 | `DepotsKeys` | Stored depot decryption keys. | `DepotID`, `Key`, `Date` |
 
 #### Lookup and support tables
@@ -609,16 +611,21 @@ Depot processing and file downloading are separate concerns:
 - `DepotProcessor` tracks manifests, sizes, files, and depot history
 - `FileDownloader` only downloads selected files for depots explicitly mapped in `files/depots_mapping.json` and `files/files.json`
 
-### Current depot storage limitation
+### Current depot storage model
 
-The current baseline schema stores one current row per `DepotID` in `Depots`.
+The baseline schema now splits depot data into:
 
-That means:
+- `Depots` as a preferred-branch summary row per `DepotID`
+- `DepotBranches` as the canonical per-branch depot state
+- `DepotsFiles` keyed by `DepotID + BranchName + File`
+- `DepotsHistory` carrying `BranchName` for manifest and file history
 
-- branch metadata is partially present through `Builds.BranchName`
-- depot current-state storage is still effectively depot-level, not fully branch-aware
+Practical consequence:
 
-For future work on a greenfield model, see:
+- depot analytics can distinguish `public`, `beta`, `previous`, and other branches for the same depot
+- simpler compatibility paths can still read `Depots` without joining `DepotBranches`
+
+For broader greenfield modeling beyond the current implementation, see:
 
 - `/C:/git/SteamDatabaseBackend/docs/depot-data-model-research.md`
 

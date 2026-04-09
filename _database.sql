@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS `ChangelistsSubs` (
 CREATE TABLE IF NOT EXISTS `Depots` (
   `DepotID` int(10) UNSIGNED NOT NULL,
   `Name` varchar(1000) CHARACTER SET utf8mb4 NOT NULL DEFAULT 'SteamDB Unknown Depot',
+  `PreferredBranchName` varchar(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'public',
   `BuildID` int(10) UNSIGNED NOT NULL DEFAULT 0,
   `ManifestID` bigint(20) unsigned NOT NULL DEFAULT 0,
   `LastManifestID` bigint(20) unsigned NOT NULL DEFAULT 0,
@@ -90,13 +91,31 @@ CREATE TABLE IF NOT EXISTS `Depots` (
   PRIMARY KEY (`DepotID`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE TABLE IF NOT EXISTS `DepotBranches` (
+  `DepotID` int(10) UNSIGNED NOT NULL,
+  `BranchName` varchar(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'public',
+  `BuildID` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `ManifestID` bigint(20) unsigned NOT NULL DEFAULT 0,
+  `LastManifestID` bigint(20) unsigned NOT NULL DEFAULT 0,
+  `ManifestDate` datetime DEFAULT NULL,
+  `FilenamesEncrypted` tinyint(1) NOT NULL DEFAULT 0,
+  `SizeOriginal` bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+  `SizeCompressed` bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+  `LastUpdated` datetime NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`DepotID`,`BranchName`) USING BTREE,
+  KEY `ManifestID` (`ManifestID`),
+  KEY `BuildID` (`BuildID`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 CREATE TABLE IF NOT EXISTS `DepotsFiles` (
   `DepotID` int(10) UNSIGNED NOT NULL,
+  `BranchName` varchar(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'public',
   `File` varchar(260) COLLATE utf8mb4_bin NOT NULL,
   `Hash` binary(20) DEFAULT NULL,
   `Size` bigint(20) UNSIGNED NOT NULL,
   `Flags` smallint(5) UNSIGNED NOT NULL,
-  PRIMARY KEY (`DepotID`,`File`)
+  PRIMARY KEY (`DepotID`,`BranchName`,`File`),
+  KEY `DepotID_File` (`DepotID`,`File`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE TABLE IF NOT EXISTS `DepotsHistory` (
@@ -104,6 +123,7 @@ CREATE TABLE IF NOT EXISTS `DepotsHistory` (
   `ChangeID` int(10) UNSIGNED NOT NULL,
   `ManifestID` bigint(20) UNSIGNED NOT NULL,
   `DepotID` int(10) UNSIGNED NOT NULL,
+  `BranchName` varchar(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
   `Time` datetime NOT NULL DEFAULT current_timestamp(),
   `Action` enum('added','removed','modified','modified_flags','manifest_change','added_to_sub','removed_from_sub','files_decrypted') CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   `File` varchar(260) COLLATE utf8mb4_bin NOT NULL,
@@ -111,6 +131,7 @@ CREATE TABLE IF NOT EXISTS `DepotsHistory` (
   `NewValue` bigint(20) UNSIGNED NOT NULL,
   PRIMARY KEY (`ID`),
   KEY `DepotID` (`DepotID`),
+  KEY `DepotID_BranchName` (`DepotID`,`BranchName`),
   KEY `ManifestID` (`ManifestID`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 

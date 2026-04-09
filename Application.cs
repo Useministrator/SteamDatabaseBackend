@@ -15,6 +15,7 @@ namespace SteamDatabaseBackend
 {
     internal static class Application
     {
+        private static readonly TimeSpan TaskDrainTimeout = TimeSpan.FromSeconds(15);
         private static Thread IrcThread;
         private static RSS RssReader;
         private static HttpServer HttpServer;
@@ -80,17 +81,22 @@ namespace SteamDatabaseBackend
         {
             Log.WriteInfo(nameof(Application), "Exiting...");
 
+            var steam = Steam.Instance;
+            steam.IsRunning = false;
+
             if (Settings.Current.BuiltInHttpServerPort > 0 && HttpServer != null)
             {
                 HttpServer.Dispose();
                 HttpServer = null;
             }
 
+            TaskManager.CancelAllTasks();
+            TaskManager.WaitForDrain(TaskDrainTimeout);
+
             try
             {
-                Steam.Instance.IsRunning = false;
-                Steam.Instance.Client.Disconnect();
-                Steam.Instance.Dispose();
+                steam.Client.Disconnect();
+                steam.Dispose();
             }
             catch (Exception e)
             {
@@ -109,12 +115,25 @@ namespace SteamDatabaseBackend
                 IrcThread.Join(TimeSpan.FromSeconds(5));
             }
 
-            TaskManager.CancelAllTasks();
-
             if (!Settings.IsFullRun)
             {
-                LocalConfig.Update("backend.changenumber", Steam.Instance.PICSChanges.PreviousChangeNumber.ToString())
-                    .GetAwaiter().GetResult();
+                TrySaveShutdownState("backend.changenumber", steam.PICSChanges.PreviousChangeNumber.ToString());
+            }
+        }
+
+        internal static bool TrySaveShutdownState(string key, string value)
+        {
+            try
+            {
+                LocalConfig.Update(key, value).GetAwaiter().GetResult();
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                Log.WriteWarn(nameof(Application), $"Failed to persist shutdown state for {key}: {e.Message}");
+
+                return false;
             }
         }
     }
