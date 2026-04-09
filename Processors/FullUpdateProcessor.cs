@@ -17,6 +17,7 @@ namespace SteamDatabaseBackend
     internal static class FullUpdateProcessor
     {
         private const int IdsPerMetadataRequest = 5000;
+        private const int StoreAppListPageSize = 50000;
 
         public static async Task PerformSync()
         {
@@ -61,40 +62,7 @@ namespace SteamDatabaseBackend
                     else
                     {
                         apps = (await db.QueryAsync<uint>("(SELECT `AppID` FROM `Apps` ORDER BY `AppID` DESC) UNION DISTINCT (SELECT `AppID` FROM `SubsApps` WHERE `Type` = 'app') ORDER BY `AppID` DESC")).ToList();
-
-                        try
-                        {
-                            using var steamApps = Steam.Configuration.GetAsyncWebAPIInterface("ISteamApps");
-                            var response = await steamApps.CallAsync(HttpMethod.Get, "GetAppList", 2);
-                            var apiApps = response["apps"].Children.Select(app => app["appid"].AsUnsignedInteger()).ToList();
-
-                            using var steamStore = Steam.Configuration.GetAsyncWebAPIInterface("IStoreService");
-                            var lastAppId = 0u;
-                            var storeApiApps = new List<uint>();
-
-                            do
-                            {
-                                response = await steamStore.CallAsync(HttpMethod.Get, "GetAppList", 1, new Dictionary<string, object>
-                                {
-                                    { "last_appid", lastAppId },
-                                    { "max_results", 50000 },
-                                });
-
-                                storeApiApps.AddRange(response["apps"].Children.Select(app => app["appid"].AsUnsignedInteger()).ToList());
-                                lastAppId = response["last_appid"].AsUnsignedInteger();
-                            }
-                            while (response["have_more_results"].AsBoolean());
-
-                            apps = apps
-                                .Union(apiApps)
-                                .Union(storeApiApps)
-                                .OrderByDescending(x => x)
-                                .ToList();
-                        }
-                        catch (Exception)
-                        {
-                            //
-                        }
+                        apps = await LoadFullRunAppsAsync(apps);
                     }
 
                     if (Settings.FullRun != FullRunState.WithForcedDepots)
@@ -112,6 +80,95 @@ namespace SteamDatabaseBackend
             }
 
             await RequestUpdateForList(apps, packages, true);
+        }
+
+        private static async Task<List<uint>> LoadFullRunAppsAsync(List<uint> appsFromDatabase)
+        {
+            var apps = new HashSet<uint>(appsFromDatabase);
+
+            try
+            {
+                var storeApiApps = await LoadStoreAppListAsync();
+
+                if (storeApiApps.Count > 0)
+                {
+                    apps.UnionWith(storeApiApps);
+                    Log.WriteInfo(nameof(FullUpdateProcessor), $"Loaded {storeApiApps.Count:N0} app ids from IStoreService.GetAppList");
+                }
+                else
+                {
+                    Log.WriteWarn(nameof(FullUpdateProcessor), "IStoreService.GetAppList returned no app ids");
+                }
+            }
+            catch (Exception e)
+            {
+                Log.WriteWarn(nameof(FullUpdateProcessor), $"Failed to load app list from IStoreService.GetAppList: {e.Message}");
+            }
+
+            if (apps.Count == 0)
+            {
+                Log.WriteWarn(nameof(FullUpdateProcessor), "Full run has no app ids to process. On an empty database this usually means the bootstrap app list source failed.");
+            }
+
+            return apps.OrderByDescending(x => x).ToList();
+        }
+
+        private static async Task<List<uint>> LoadStoreAppListAsync()
+        {
+            using var steamStore = Steam.Configuration.GetAsyncWebAPIInterface("IStoreService");
+
+            var appIds = new HashSet<uint>();
+            var lastAppId = 0u;
+
+            while (true)
+            {
+                var response = await steamStore.CallAsync(HttpMethod.Get, "GetAppList", 1, new Dictionary<string, object>
+                {
+                    { "last_appid", lastAppId },
+                    { "max_results", StoreAppListPageSize },
+                });
+
+                var pageAppIds = GetAppIdsFromWebApiResponse(response);
+
+                foreach (var appId in pageAppIds)
+                {
+                    appIds.Add(appId);
+                }
+
+                var envelope = GetResponseEnvelope(response);
+                var haveMoreResults = envelope["have_more_results"].AsBoolean();
+                var nextAppId = envelope["last_appid"].AsUnsignedInteger();
+
+                if (!haveMoreResults || nextAppId == 0 || nextAppId == lastAppId)
+                {
+                    break;
+                }
+
+                lastAppId = nextAppId;
+            }
+
+            return appIds.ToList();
+        }
+
+        private static KeyValue GetResponseEnvelope(KeyValue response)
+        {
+            return response["response"].Children.Count > 0 ? response["response"] : response;
+        }
+
+        private static List<uint> GetAppIdsFromWebApiResponse(KeyValue response)
+        {
+            var envelope = GetResponseEnvelope(response);
+            var appNodes = envelope["apps"].Children;
+
+            if (appNodes.Count == 0 && envelope["applist"].Children.Count > 0)
+            {
+                appNodes = envelope["applist"]["apps"].Children;
+            }
+
+            return appNodes
+                .Select(app => app["appid"].AsUnsignedInteger())
+                .Where(appId => appId > 0)
+                .ToList();
         }
 
         public static async Task FullUpdateAppsMetadata()
