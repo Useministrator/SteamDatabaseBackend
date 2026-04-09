@@ -5,6 +5,7 @@
  */
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
@@ -28,6 +29,7 @@ namespace SteamDatabaseBackend
 
         public class ManifestJob
         {
+            public uint AppId;
             public uint ChangeNumber;
             public uint DepotId;
             public int BuildId;
@@ -45,8 +47,17 @@ namespace SteamDatabaseBackend
         public const string HistoryQuery = "INSERT INTO `DepotsHistory` (`ManifestID`, `ChangeID`, `DepotID`, `File`, `Action`, `OldValue`, `NewValue`) VALUES (@ManifestID, @ChangeID, @DepotID, @File, @Action, @OldValue, @NewValue)";
 
         private static readonly object UpdateScriptLock = new object();
+        private static readonly TimeSpan CdnAuthTokenRefreshWindow = TimeSpan.FromMinutes(1);
+
+        private sealed class CachedCdnAuthToken
+        {
+            public string Token { get; init; }
+            public DateTime Expiration { get; init; }
+        }
 
         private readonly Dictionary<uint, byte> DepotLocks = new Dictionary<uint, byte>();
+        private readonly ConcurrentDictionary<(uint AppId, uint DepotId, string Host), CachedCdnAuthToken> CdnAuthTokens = new();
+        private readonly ConcurrentDictionary<(uint AppId, uint DepotId, string Host), SemaphoreSlim> CdnAuthTokenLocks = new();
         private SemaphoreSlim ManifestDownloadSemaphore = new SemaphoreSlim(15);
         private readonly string UpdateScript;
 
@@ -71,10 +82,106 @@ namespace SteamDatabaseBackend
 
             Client.RequestTimeout = TimeSpan.FromSeconds(30);
 
-            FileDownloader.SetCDNClient(CDNClient);
+            FileDownloader.SetCDNClient(CDNClient, GetCdnAuthTokenAsync, InvalidateCdnAuthToken);
 
             DepotNameStart = new Regex("^(\u00dalo\u017ei\u0161t\u011b \u2013|\u0425\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0435|D\u00e9p\u00f4t :|Depot|Depot:|Repositorio) ", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.ExplicitCapture);
             DepotNameEnd = new Regex(" (- magazyn zawarto\u015bci|\u03bd\u03c4\u03b5\u03c0\u03cc|\u0441\u0445\u043e\u0432\u0438\u0449\u0435|\u0e14\u0e35\u0e42\u0e1b|\u2013 depot|\u30c7\u30dd|\u4e2a Depot|\uac1c\uc758 \ub514\ud3ec|dep\u00e5|dep\u00f3|Depo|Depot|depot|depotti)$", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.ExplicitCapture);
+        }
+
+        private static string GetDisplayAppName(string appName, uint appId)
+        {
+            appName = Utils.RemoveControlCharacters(appName ?? string.Empty).Trim();
+
+            return string.IsNullOrEmpty(appName) ? $"AppID {appId}" : appName;
+        }
+
+        private static string FormatDepotHint(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            return value.Trim().ToLowerInvariant() switch
+            {
+                "windows" => "Windows",
+                "linux" => "Linux",
+                "macos" => "macOS",
+                "mac" => "macOS",
+                "64" => "64-bit",
+                "64bit" => "64-bit",
+                "x64" => "64-bit",
+                "32" => "32-bit",
+                "32bit" => "32-bit",
+                "x86" => "32-bit",
+                _ => value.Trim(),
+            };
+        }
+
+        private static string GetDepotName(KeyValue depot, uint appId, uint depotId, string explicitDepotName)
+        {
+            explicitDepotName = Utils.RemoveControlCharacters(explicitDepotName ?? string.Empty).Trim();
+
+            if (!string.IsNullOrEmpty(explicitDepotName))
+            {
+                return explicitDepotName;
+            }
+
+            var appName = GetDisplayAppName(Steam.GetAppName(appId), appId);
+            var hints = new List<string>();
+            var config = depot["config"];
+
+            if (config != KeyValue.Invalid)
+            {
+                var osList = config["oslist"].AsString();
+
+                if (!string.IsNullOrWhiteSpace(osList))
+                {
+                    var formattedOs = string.Join("/", osList
+                        .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(FormatDepotHint)
+                        .Where(x => !string.IsNullOrEmpty(x))
+                        .Distinct(StringComparer.OrdinalIgnoreCase));
+
+                    if (!string.IsNullOrEmpty(formattedOs))
+                    {
+                        hints.Add(formattedOs);
+                    }
+                }
+
+                var osArch = FormatDepotHint(config["osarch"].AsString());
+
+                if (!string.IsNullOrEmpty(osArch))
+                {
+                    hints.Add(osArch);
+                }
+
+                var language = config["language"].AsString();
+
+                if (!string.IsNullOrWhiteSpace(language))
+                {
+                    hints.Add(language.Trim());
+                }
+
+                if (config["lowviolence"].AsBoolean())
+                {
+                    hints.Add("low violence");
+                }
+            }
+
+            if (depot["sharedinstall"].AsBoolean())
+            {
+                hints.Add("shared");
+            }
+
+            if (uint.TryParse(depot["dlcappid"].Value, out var dlcAppId))
+            {
+                hints.Add($"DLC {dlcAppId}");
+            }
+
+            return hints.Count == 0
+                ? $"{appName} Depot {depotId}"
+                : $"{appName} Depot {depotId} ({string.Join(", ", hints.Distinct(StringComparer.OrdinalIgnoreCase))})";
         }
 
         public void Dispose()
@@ -159,6 +266,7 @@ namespace SteamDatabaseBackend
             {
                 var request = new ManifestJob
                 {
+                    AppId = appID,
                     ChangeNumber = changeNumber,
                 };
 
@@ -174,17 +282,14 @@ namespace SteamDatabaseBackend
                     continue;
                 }
 
-                request.DepotName = depot["name"].AsString();
+                var explicitDepotName = depot["name"].AsString();
+                request.DepotName = GetDepotName(depot, appID, request.DepotId, explicitDepotName);
 
-                if (string.IsNullOrEmpty(request.DepotName))
-                {
-                    request.DepotName = $"SteamDB Unnamed Depot {request.DepotId}";
-                }
-                else if (depot["dlcappid"].Value != null)
+                if (!string.IsNullOrEmpty(explicitDepotName) && depot["dlcappid"].Value != null)
                 {
                     if (uint.TryParse(depot["dlcappid"].Value, out var dlcAppId))
                     {
-                        dlcNames[dlcAppId] = request.DepotName;
+                        dlcNames[dlcAppId] = explicitDepotName;
                     }
                 }
 
@@ -401,9 +506,88 @@ namespace SteamDatabaseBackend
             steamContent = Steam.Instance.Client.GetHandler<SteamContent>();
             var requestCode = await steamContent.GetManifestRequestCode(depotId, appId, manifestId, branch);
 
-            Log.WriteDebug(nameof(DepotProcessor), $"Got manifest request code for {depotId} {manifestId} result: {requestCode}");
+            if (requestCode == 0)
+            {
+                Log.WriteDebug(nameof(DepotProcessor), $"No manifest request code granted for app {appId} depot {depotId} manifest {manifestId} ({branch})");
+            }
+            else
+            {
+                Log.WriteDebug(nameof(DepotProcessor), $"Got manifest request code for {depotId} {manifestId} result: {requestCode}");
+            }
 
             return requestCode;
+        }
+
+        private async Task<string> GetCdnAuthTokenAsync(ManifestJob depot, Server server, bool forceRefresh = false)
+        {
+            if (server == null)
+            {
+                return null;
+            }
+
+            var cacheKey = (depot.AppId, depot.DepotId, server.Host);
+
+            if (!forceRefresh
+                && CdnAuthTokens.TryGetValue(cacheKey, out var cachedToken)
+                && cachedToken.Expiration > DateTime.UtcNow.Add(CdnAuthTokenRefreshWindow))
+            {
+                return cachedToken.Token;
+            }
+
+            var authTokenLock = CdnAuthTokenLocks.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
+
+            await authTokenLock.WaitAsync(TaskManager.TaskCancellationToken.Token).ConfigureAwait(false);
+
+            try
+            {
+                if (!forceRefresh
+                    && CdnAuthTokens.TryGetValue(cacheKey, out cachedToken)
+                    && cachedToken.Expiration > DateTime.UtcNow.Add(CdnAuthTokenRefreshWindow))
+                {
+                    return cachedToken.Token;
+                }
+
+                steamContent ??= Steam.Instance.Client.GetHandler<SteamContent>();
+
+                var cdnAuthToken = await steamContent.GetCDNAuthToken(depot.AppId, depot.DepotId, server.Host).ConfigureAwait(false);
+
+                if (cdnAuthToken.Result != EResult.OK || string.IsNullOrEmpty(cdnAuthToken.Token))
+                {
+                    CdnAuthTokens.TryRemove(cacheKey, out _);
+
+                    Log.WriteDebug(nameof(DepotProcessor), $"Failed to get CDN auth token for app {depot.AppId} depot {depot.DepotId} host {server.Host}: {cdnAuthToken.Result}");
+
+                    return null;
+                }
+
+                var expiration = cdnAuthToken.Expiration == default
+                    ? DateTime.UtcNow.AddMinutes(5)
+                    : cdnAuthToken.Expiration.ToUniversalTime();
+
+                CdnAuthTokens[cacheKey] = new CachedCdnAuthToken
+                {
+                    Token = cdnAuthToken.Token,
+                    Expiration = expiration,
+                };
+
+                Log.WriteDebug(nameof(DepotProcessor), $"Got CDN auth token for app {depot.AppId} depot {depot.DepotId} host {server.Host} (expires {cdnAuthToken.Expiration:u})");
+
+                return cdnAuthToken.Token;
+            }
+            finally
+            {
+                authTokenLock.Release();
+            }
+        }
+
+        private void InvalidateCdnAuthToken(ManifestJob depot, Server server)
+        {
+            if (server == null)
+            {
+                return;
+            }
+
+            CdnAuthTokens.TryRemove((depot.AppId, depot.DepotId, server.Host), out _);
         }
 
         private static bool TryGetManifestId(KeyValue branch, out ulong manifestId)
@@ -445,18 +629,13 @@ namespace SteamDatabaseBackend
 
             foreach (var depot in depots)
             {
-                if (depot.DepotKey == null)
-                {
-                    await GetDepotDecryptionKey(Steam.Instance.Apps, depot, appID);
-
-                    if (depot.DepotKey == null
+                if (depot.DepotKey == null
                     && depot.LastManifestId == depot.ManifestId
                     && Settings.FullRun != FullRunState.WithForcedDepots)
-                    {
-                        RemoveLock(depot.DepotId);
+                {
+                    RemoveLock(depot.DepotId);
 
-                        continue;
-                    }
+                    continue;
                 }
 
                 depot.Server = GetContentServer();
@@ -464,18 +643,34 @@ namespace SteamDatabaseBackend
                 DepotManifest depotManifest = null;
                 var lastError = string.Empty;
 
-                ulong manifestRequestCode = 0;
-                var manifestRequestCodeExpiration = DateTime.MinValue;
-                
-                manifestRequestCode = await GetDepotManifestRequestCodeAsync(depot.DepotId, appID, depot.ManifestId, depot.BranchName);
+                var manifestRequestCode = await GetDepotManifestRequestCodeAsync(depot.DepotId, appID, depot.ManifestId, depot.BranchName);
+                if (manifestRequestCode == 0)
+                {
+                    RemoveLock(depot.DepotId);
+
+                    continue;
+                }
+
+                var refreshCdnAuthToken = false;
+
                 for (var i = 0; i <= 5; i++)
                 {
                     try
                     {
                         await ManifestDownloadSemaphore.WaitAsync(TaskManager.TaskCancellationToken.Token).ConfigureAwait(false);
-                        depotManifest = await CDNClient.DownloadManifestAsync(depot.DepotId, depot.ManifestId, manifestRequestCode, depot.Server, depot.DepotKey, null);
+                        var cdnAuthToken = await GetCdnAuthTokenAsync(depot, depot.Server, refreshCdnAuthToken).ConfigureAwait(false);
+                        refreshCdnAuthToken = false;
+                        depotManifest = await CDNClient.DownloadManifestAsync(depot.DepotId, depot.ManifestId, manifestRequestCode, depot.Server, depot.DepotKey, null, cdnAuthToken);
 
                         break;
+                    }
+                    catch (SteamKitWebRequestException e) when (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
+                    {
+                        refreshCdnAuthToken = true;
+                        InvalidateCdnAuthToken(depot, depot.Server);
+                        lastError = e.Message;
+
+                        Log.WriteError(nameof(DepotProcessor), $"Failed to download depot manifest for app {appID} depot {depot.DepotId} ({depot.Server}: {lastError}) (#{i})");
                     }
                     catch (Exception e)
                     {
@@ -516,6 +711,11 @@ namespace SteamDatabaseBackend
                     }
 
                     continue;
+                }
+
+                if (depot.DepotKey == null && (depotManifest.FilenamesEncrypted || FileDownloader.IsImportantDepot(depot.DepotId)))
+                {
+                    await GetDepotDecryptionKey(Steam.Instance.Apps, depot, appID);
                 }
 
                 var task = ProcessDepotAfterDownload(depot, depotManifest);
@@ -653,12 +853,6 @@ namespace SteamDatabaseBackend
 
         private static async Task<(uint, EResult)> ProcessDepotAfterDownload(ManifestJob request, DepotManifest depotManifest)
         {
-            if (depotManifest.FilenamesEncrypted && request.DepotKey != null)
-            {
-                Log.WriteError(nameof(DepotProcessor), $"Depot key for depot {request.DepotId} is invalid?");
-                IRC.Instance.SendOps($"[Tokens] Looks like the depot key for depot {request.DepotId} is invalid");
-            }
-
             await using var db = await Database.GetConnectionAsync();
             await using var transaction = await db.BeginTransactionAsync();
 
@@ -672,9 +866,25 @@ namespace SteamDatabaseBackend
         {
             var filesOld = (await db.QueryAsync<DepotFile>("SELECT `File`, `Hash`, `Size`, `Flags` FROM `DepotsFiles` WHERE `DepotID` = @DepotID", new { DepotID = request.DepotId }, transaction)).ToDictionary(x => x.File, x => x);
             var filesAdded = new List<DepotFile>();
-            var shouldHistorize = filesOld.Count > 0 && !depotManifest.FilenamesEncrypted; // Don't historize file additions if we didn't have any data before
+            var currentManifestFilenamesEncrypted = depotManifest.FilenamesEncrypted;
 
-            if (request.StoredFilenamesEncrypted && !depotManifest.FilenamesEncrypted)
+            if (currentManifestFilenamesEncrypted && request.DepotKey != null)
+            {
+                var sampleFile = depotManifest.Files.FirstOrDefault();
+
+                if (sampleFile == null || TryDecryptFilename(sampleFile.FileName.Replace("\n", string.Empty), request.DepotKey, out _))
+                {
+                    currentManifestFilenamesEncrypted = false;
+                }
+                else
+                {
+                    Log.WriteWarn(nameof(DepotProcessor), $"Failed to decrypt filenames for depot {request.DepotId} with the current depot key");
+                }
+            }
+
+            var shouldHistorize = filesOld.Count > 0 && !currentManifestFilenamesEncrypted; // Don't historize file additions if we didn't have any data before
+
+            if (request.StoredFilenamesEncrypted && !currentManifestFilenamesEncrypted && request.DepotKey != null)
             {
                 Log.WriteInfo(nameof(DepotProcessor), $"Depot {request.DepotId} will decrypt stored filenames");
 
@@ -702,7 +912,7 @@ namespace SteamDatabaseBackend
 
             foreach (var file in depotManifest.Files.OrderByDescending(x => x.FileName))
             {
-                var name = depotManifest.FilenamesEncrypted ? file.FileName.Replace("\n", "") : file.FileName.Replace('\\', '/');
+                var name = GetStoredFileName(file.FileName, depotManifest.FilenamesEncrypted, currentManifestFilenamesEncrypted ? null : request.DepotKey);
 
                 byte[] hash = null;
 
@@ -831,13 +1041,52 @@ namespace SteamDatabaseBackend
                 {
                     DepotID = request.DepotId,
                     ManifestID = request.ManifestId,
-                    depotManifest.FilenamesEncrypted,
+                    FilenamesEncrypted = currentManifestFilenamesEncrypted,
                     ManifestDate = depotManifest.CreationTime,
                     SizeOriginal = depotManifest.TotalUncompressedSize,
                     SizeCompressed = depotManifest.TotalCompressedSize,
                 }, transaction);
 
             return EResult.OK;
+        }
+
+        internal static string GetStoredFileName(string name, bool filenamesEncrypted, byte[] depotKey)
+        {
+            if (!filenamesEncrypted)
+            {
+                return name.Replace('\\', '/');
+            }
+
+            name = name.Replace("\n", string.Empty);
+
+            return depotKey != null && TryDecryptFilename(name, depotKey, out var decryptedName)
+                ? decryptedName
+                : name;
+        }
+
+        internal static bool TryDecryptFilename(string name, byte[] depotKey, out string decryptedName)
+        {
+            decryptedName = null;
+
+            if (depotKey == null || string.IsNullOrEmpty(name))
+            {
+                return false;
+            }
+
+            try
+            {
+                decryptedName = DecryptFilename(name, depotKey);
+
+                return !string.IsNullOrWhiteSpace(decryptedName);
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
+            catch (CryptographicException)
+            {
+                return false;
+            }
         }
 
         private static string DecryptFilename(string name, byte[] depotKey)

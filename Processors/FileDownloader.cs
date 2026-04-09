@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Buffers;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -33,10 +34,17 @@ namespace SteamDatabaseBackend
         private static readonly Dictionary<uint, Regex> Files = new Dictionary<uint, Regex>();
         private static Dictionary<uint, string> DownloadFolders = new Dictionary<uint, string>();
         private static Client CDNClient;
+        private static Func<DepotProcessor.ManifestJob, Server, bool, Task<string>> CdnAuthTokenProvider;
+        private static Action<DepotProcessor.ManifestJob, Server> CdnAuthTokenInvalidator;
 
-        public static void SetCDNClient(Client cdnClient)
+        public static void SetCDNClient(
+            Client cdnClient,
+            Func<DepotProcessor.ManifestJob, Server, bool, Task<string>> cdnAuthTokenProvider = null,
+            Action<DepotProcessor.ManifestJob, Server> cdnAuthTokenInvalidator = null)
         {
             CDNClient = cdnClient;
+            CdnAuthTokenProvider = cdnAuthTokenProvider;
+            CdnAuthTokenInvalidator = cdnAuthTokenInvalidator;
 
             var file = Path.Combine(Application.Path, "files", "depots_mapping.json");
 
@@ -89,7 +97,14 @@ namespace SteamDatabaseBackend
         public static async Task<EResult> DownloadFilesFromDepot(DepotProcessor.ManifestJob job, DepotManifest depotManifest)
         {
             var filesRegex = Files[job.DepotId];
-            var files = depotManifest.Files.Where(x => filesRegex.IsMatch(x.FileName.Replace('\\', '/'))).ToList();
+            var files = depotManifest.Files
+                .Select(file => new
+                {
+                    File = file,
+                    Name = DepotProcessor.GetStoredFileName(file.FileName, depotManifest.FilenamesEncrypted, job.DepotKey),
+                })
+                .Where(file => filesRegex.IsMatch(file.Name))
+                .ToList();
             var downloadState = EResult.Fail;
 
             ConcurrentDictionary<string, ExistingFileData> existingFileData;
@@ -108,7 +123,7 @@ namespace SteamDatabaseBackend
                 }
             }
 
-            foreach (var file in existingFileData.Keys.Except(files.Select(x => x.FileName)))
+            foreach (var file in existingFileData.Keys.Except(files.Select(x => x.Name)))
             {
                 Log.WriteWarn(nameof(FileDownloader), $"\"{file}\" no longer exists in manifest");
             }
@@ -123,14 +138,14 @@ namespace SteamDatabaseBackend
                 var file = files[i];
                 fileTasks[i] = TaskManager.Run(async () =>
                 {
-                    var existingFile = existingFileData.GetOrAdd(file.FileName, _ => new ExistingFileData());
+                    var existingFile = existingFileData.GetOrAdd(file.Name, _ => new ExistingFileData());
                     EResult fileState;
 
                     try
                     {
                         await ChunkDownloadingSemaphore.WaitAsync().ConfigureAwait(false);
 
-                        fileState = await DownloadFile(job, file, existingFile);
+                        fileState = await DownloadFile(job, file.File, file.Name, existingFile);
                     }
                     finally
                     {
@@ -139,7 +154,7 @@ namespace SteamDatabaseBackend
 
                     if (fileState == EResult.OK || fileState == EResult.SameAsPreviousValue)
                     {
-                        existingFile.FileHash = file.FileHash;
+                        existingFile.FileHash = file.File.FileHash;
 
                         downloadedFiles++;
                     }
@@ -175,10 +190,10 @@ namespace SteamDatabaseBackend
             return job.Result;
         }
 
-        private static async Task<EResult> DownloadFile(DepotProcessor.ManifestJob job, DepotManifest.FileData file, ExistingFileData existingFile)
+        private static async Task<EResult> DownloadFile(DepotProcessor.ManifestJob job, DepotManifest.FileData file, string fileName, ExistingFileData existingFile)
         {
-            var directory = Path.Combine(Application.Path, "files", DownloadFolders[job.DepotId], Path.GetDirectoryName(file.FileName));
-            var finalPath = new FileInfo(Path.Combine(directory, Path.GetFileName(file.FileName)));
+            var directory = Path.Combine(Application.Path, "files", DownloadFolders[job.DepotId], Path.GetDirectoryName(fileName));
+            var finalPath = new FileInfo(Path.Combine(directory, Path.GetFileName(fileName)));
             var downloadPath = new FileInfo(Path.Combine(Path.GetTempPath(), Path.ChangeExtension(Path.GetRandomFileName(), ".steamdb_tmp")));
 
             if (!Directory.Exists(directory))
@@ -194,14 +209,14 @@ namespace SteamDatabaseBackend
                         // FileInfo.Create returns a stream but we don't need it
                     }
 
-                    Log.WriteInfo($"FileDownloader {job.DepotId}", $"{file.FileName} created an empty file");
+                    Log.WriteInfo($"FileDownloader {job.DepotId}", $"{fileName} created an empty file");
 
                     return EResult.SameAsPreviousValue;
                 }
                 else if (finalPath.Length == 0)
                 {
 #if DEBUG
-                    Log.WriteDebug($"FileDownloader {job.DepotId}", $"{file.FileName} is already empty");
+                    Log.WriteDebug($"FileDownloader {job.DepotId}", $"{fileName} is already empty");
 #endif
 
                     return EResult.SameAsPreviousValue;
@@ -210,7 +225,7 @@ namespace SteamDatabaseBackend
             else if (existingFile.FileHash != null && file.FileHash.SequenceEqual(existingFile.FileHash))
             {
 #if DEBUG
-                Log.WriteDebug($"FileDownloader {job.DepotId}", $"{file.FileName} already matches the file we have");
+                    Log.WriteDebug($"FileDownloader {job.DepotId}", $"{fileName} already matches the file we have");
 #endif
 
                 return EResult.SameAsPreviousValue;
@@ -247,7 +262,7 @@ namespace SteamDatabaseBackend
                                 fs.Write(oldData, 0, oldData.Length);
 
 #if DEBUG
-                                Log.WriteDebug($"FileDownloader {job.DepotId}", $"{file.FileName} Found chunk ({chunk.Offset}), not downloading");
+                                Log.WriteDebug($"FileDownloader {job.DepotId}", $"{fileName} Found chunk ({chunk.Offset}), not downloading");
 #endif
                             }
                             else
@@ -255,7 +270,7 @@ namespace SteamDatabaseBackend
                                 neededChunks.Add(chunk);
 
 #if DEBUG
-                                Log.WriteDebug($"FileDownloader {job.DepotId}", $"{file.FileName} Found chunk ({chunk.Offset}), but checksum differs");
+                                Log.WriteDebug($"FileDownloader {job.DepotId}", $"{fileName} Found chunk ({chunk.Offset}), but checksum differs");
 #endif
                             }
                         }
@@ -275,7 +290,7 @@ namespace SteamDatabaseBackend
             var downloadedSize = file.TotalSize - (ulong)neededChunks.Sum(x => x.UncompressedLength);
             var chunkTasks = new Task[neededChunks.Count];
 
-            Log.WriteInfo($"FileDownloader {job.DepotId}", $"Downloading {file.FileName} ({neededChunks.Count} out of {chunks.Count} chunks to download)");
+            Log.WriteInfo($"FileDownloader {job.DepotId}", $"Downloading {fileName} ({neededChunks.Count} out of {chunks.Count} chunks to download)");
 
             for (var i = 0; i < chunkTasks.Length; i++)
             {
@@ -286,7 +301,7 @@ namespace SteamDatabaseBackend
 
                     if (!result)
                     {
-                        Log.WriteWarn($"FileDownloader {job.DepotId}", $"Failed to download chunk for {file.FileName} ({chunk.Offset})");
+                        Log.WriteWarn($"FileDownloader {job.DepotId}", $"Failed to download chunk for {fileName} ({chunk.Offset})");
 
                         chunkCancellation.Cancel();
                     }
@@ -294,7 +309,7 @@ namespace SteamDatabaseBackend
                     {
                         downloadedSize += chunk.UncompressedLength;
 
-                        Log.WriteDebug(nameof(FileDownloader), $"{job.DepotName} [{downloadedSize / (float) file.TotalSize * 100.0f,6:#00.00}%] {file.FileName}");
+                        Log.WriteDebug(nameof(FileDownloader), $"{job.DepotName} [{downloadedSize / (float) file.TotalSize * 100.0f,6:#00.00}%] {fileName}");
                     }
                 });
             }
@@ -314,10 +329,10 @@ namespace SteamDatabaseBackend
                 {
                     job.DownloadCorrupted = true;
 
-                    IRC.Instance.SendOps($"{Colors.OLIVE}[{job.DepotName}]{Colors.NORMAL} Failed to correctly download {Colors.BLUE}{file.FileName}");
+                    IRC.Instance.SendOps($"{Colors.OLIVE}[{job.DepotName}]{Colors.NORMAL} Failed to correctly download {Colors.BLUE}{fileName}");
                 }
 
-                Log.WriteWarn($"FileDownloader {job.DepotId}", $"Hash check failed for {file.FileName} ({job.Server})");
+                Log.WriteWarn($"FileDownloader {job.DepotId}", $"Hash check failed for {fileName} ({job.Server})");
 
                 downloadPath.Delete();
                 existingFile.FileHash = null;
@@ -326,7 +341,7 @@ namespace SteamDatabaseBackend
                 return EResult.DataCorruption;
             }
 
-            Log.WriteInfo($"FileDownloader {job.DepotId}", $"Downloaded {file.FileName}");
+            Log.WriteInfo($"FileDownloader {job.DepotId}", $"Downloaded {fileName}");
 
             finalPath.Delete();
 
@@ -347,6 +362,7 @@ namespace SteamDatabaseBackend
         private static async Task<bool> DownloadChunk(DepotProcessor.ManifestJob job, DepotManifest.ChunkData chunk, FileInfo downloadPath, CancellationTokenSource chunkCancellation)
         {
             const int TRIES = 3;
+            var refreshCdnAuthToken = false;
 
             for (var i = 0; i <= TRIES; i++)
             {
@@ -358,7 +374,13 @@ namespace SteamDatabaseBackend
 
                     try
                     {
-                        var bytesWritten = await CDNClient.DownloadDepotChunkAsync(job.DepotId, chunk, job.Server, destination, job.DepotKey);
+                        var cdnAuthToken = CdnAuthTokenProvider == null
+                            ? null
+                            : await CdnAuthTokenProvider(job, job.Server, refreshCdnAuthToken).ConfigureAwait(false);
+
+                        refreshCdnAuthToken = false;
+
+                        var bytesWritten = await CDNClient.DownloadDepotChunkAsync(job.DepotId, chunk, job.Server, destination, job.DepotKey, null, cdnAuthToken);
 
                         await using var fs = downloadPath.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
                         fs.Seek((long)chunk.Offset, SeekOrigin.Begin);
@@ -370,6 +392,13 @@ namespace SteamDatabaseBackend
                     }
 
                     return true;
+                }
+                catch (SteamKitWebRequestException e) when (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    refreshCdnAuthToken = true;
+                    CdnAuthTokenInvalidator?.Invoke(job, job.Server);
+
+                    Log.WriteDebug($"FileDownloader {job.DepotId}", $"CDN auth failed for chunk {Convert.ToHexString(chunk.ChunkID).ToLowerInvariant()} ({job.Server}, {(int)e.StatusCode})");
                 }
                 catch (Exception e)
                 {
