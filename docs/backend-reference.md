@@ -197,6 +197,43 @@ Valid `FullRunState` values are defined in `/C:/git/SteamDatabaseBackend/Util/Fu
 | `TokensOnly` | Re-query product info only for IDs that already have stored PICS tokens. |
 | `NormalUsingMetadata` | Metadata-only pass first, then request full tokens only for changed apps/packages. |
 
+### Practical mode comparison
+
+`None` is the normal long-running service mode and is not part of the one-off maintenance matrix below.
+
+| State | Input universe | Request style | Depot and file-tree potential | Typical use |
+| --- | --- | --- | --- | --- |
+| `PackagesNormal` | Existing `Subs` plus owned package licenses. No app-list bootstrap. | Full package product info through the token pipeline. | Very limited. Updates package data, but in full-run mode it does not automatically requeue related apps for depot processing. | Fast package-only maintenance when app data is not the target. |
+| `TokensOnly` | Only IDs that already have rows in `PICSTokens` / `PICSTokensSubs`. | Full product info for token-known IDs only. | Possible for app IDs that already have stored app tokens. If only package tokens exist, it behaves close to a package-only refresh. | Revisit a known token-scoped subset without rebuilding the universe first. |
+| `ImportantOnly` | `ImportantApps` and `ImportantSubs`. | Token request first, then full product info. | Yes. This is the safest small-scope mode for testing app, build, depot, and manifest behavior. | Smoke tests, curated tracking, and targeted maintenance. |
+| `NormalUsingMetadata` | Existing `Apps`, `Subs`, and app references already known in the database. | Metadata-only first, then full product info only for changed IDs. | Yes, but only for IDs that are already known and then found changed by the metadata pass. | Differential maintenance of an already-populated database. |
+| `Enumerate` | Numeric ranges from `0` up to current max app/sub IDs plus a buffer. | Metadata-only over brute-force numeric ranges. | Possible when changed IDs are escalated into full app processing, but this is primarily an enumeration/backfill tool rather than a manifest-harvesting mode. | Gap-filling and numeric frontier exploration. |
+| `Normal` | Known app references plus store app list bootstrap; packages from `Subs` plus owned licenses. | Token request first, then full product info. | Yes. This is the main heavy full-refresh/bootstrap mode and the most practical choice for broad data ingestion. | Large initial fills and full maintenance passes. |
+| `WithForcedDepots` | Similar app universe to `Normal`, but package pass is intentionally skipped. | Token request first, then full product info. | Yes, and more aggressively than `Normal`, because it does not keep the usual “already have this manifest” short-circuit. | Rebuild or revalidate depot-layer data after depot-processing changes. |
+
+### Important behavioral notes
+
+- `OnlyOwnedDepots` still gates depot manifest downloads in all modes. Even modes that can reach depot processing will skip manifest downloads when the logged-in account does not own the depot.
+- `DepotsFiles` is only populated after a manifest is successfully downloaded and processed by `DepotProcessor.ProcessDepotAfterDownload()`. Seeing rows in `Depots` or `DepotBranches` alone does not mean file trees were collected.
+- `PackagesNormal` and package-heavy runs update `SubsApps`, but in full-run mode `SubProcessor` does not automatically requeue newly discovered apps for a second full app pass. That is why `PackagesNormal` is still effectively package-centric.
+- `NormalUsingMetadata` is efficient only when the database already contains the universe you care about. It is not a substitute for a first bootstrap.
+
+### Observed completion profile
+
+The following matrix was measured on a local MySQL test stand on April 10, 2026. Each mode ran on a fresh database imported from `_database.sql` and was considered complete after the service reached an idle state (`JobsCount=0`, `TasksCount=0`, `CurrentlyProcessingKeys=[]`, `DepotLocksKeys=[]`) three polls in a row. These numbers are useful as operator guidance, not as hard guarantees.
+
+| State | Duration | Idle reached | Result summary |
+| --- | --- | --- | --- |
+| `PackagesNormal` | ~60s | Yes | `Subs=3`, `SubsInfo=18` |
+| `TokensOnly` | ~60s | Yes | `Subs=3`, `SubsInfo=18` |
+| `ImportantOnly` | ~60s | Yes | `Apps=1`, `Subs=1`, `Builds=6`, `Depots=10`, `DepotBranches=60` |
+| `NormalUsingMetadata` | ~80s | Yes | `Apps=1`, `Subs=1`, `Builds=6`, `Depots=10`, `DepotBranches=60` |
+| `Enumerate` | ~201s | Yes | `Apps=4219`, `Subs=7142`, `AppsInfo=112164`, `SubsInfo=23859`, `DepotBranches=12673` |
+| `Normal` | ~86.7m | Yes | `Apps=161989`, `AppsInfo=4831855`, `Builds=139081`, `Depots=218945`, `DepotBranches=278442` |
+| `WithForcedDepots` | ~92.6m | Yes | `Apps=162001`, `AppsInfo=4832185`, `Builds=139087`, `Depots=218950`, `DepotBranches=278449` |
+
+In that completion matrix `DepotsFiles` remained `0` for every mode because the test runner kept `OnlyOwnedDepots=true`. Those runs prove that the modes can reach completion; they are not a benchmark of broad manifest file-tree coverage.
+
 ### Examples
 
 Normal daemon mode:
